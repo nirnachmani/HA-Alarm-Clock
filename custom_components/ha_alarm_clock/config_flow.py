@@ -5,7 +5,6 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv, selector
 from homeassistant.data_entry_flow import FlowResult
 
@@ -49,15 +48,11 @@ class HAAlarmClockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(step_id="user")
 
     @staticmethod
-    def async_get_options_flow(config_entry):
+    def async_get_options_flow(_config_entry):
         """Get the options flow."""
-        return OptionsFlowHandler(config_entry)
+        return OptionsFlowHandler()
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_entry):
-        """Initialize options flow."""
-        self.config_entry = config_entry
-
     async def async_step_init(self, user_input=None):
         """Manage the options."""
         # Get list of media players plus "none" option

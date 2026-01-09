@@ -790,7 +790,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             name=DEFAULT_NAME,
             model="HA Alarm Clock",
             sw_version="0.0.0",
-            manufacturer="@omaramin-2000",
+            manufacturer="@nirnachmani",
         )
 
 
@@ -1114,3 +1114,4 @@ async def websocket_resolve_media_metadata(hass, connection, msg):
 
 
     connection.send_result(msg["id"], result)
+

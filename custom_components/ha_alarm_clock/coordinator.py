@@ -1043,6 +1043,8 @@ class AlarmAndReminderCoordinator:
                 return "spotify_uri"
             if scheme in ("http", "https"):
                 return "http"
+            if scheme.startswith("spotify--"):
+                return "music_assistant"
             if scheme in MUSIC_ASSISTANT_URI_SCHEMES:
                 return "music_assistant"
             if scheme:

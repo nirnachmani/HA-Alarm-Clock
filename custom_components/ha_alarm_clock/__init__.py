@@ -1,1116 +1,632 @@
-"""The HA Alarm Clock integration."""
+"""Home Assistant config-entry setup for Pixie Plus Local."""
+
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass, field
+from datetime import timedelta
 import logging
-import voluptuous as vol
-from typing import Union, List, Dict
-from datetime import time, datetime
 
-from homeassistant.core import HomeAssistant, ServiceCall, callback
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.const import ATTR_NAME, ATTR_ENTITY_ID  # Use HA's built-in constants
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
-from homeassistant.components import websocket_api
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import (
-    DOMAIN,
-    SERVICE_SET_ALARM,
-    SERVICE_SET_REMINDER,
-    SERVICE_STOP_ALARM,    
-    SERVICE_SNOOZE_ALARM,  
-    SERVICE_STOP_REMINDER,
-    SERVICE_SNOOZE_REMINDER,
-    SERVICE_STOP_ALL_ALARMS,  
-    SERVICE_STOP_ALL_REMINDERS,  
-    SERVICE_STOP_ALL,  
-    SERVICE_EDIT_ALARM,  
-    SERVICE_EDIT_REMINDER,
-    SERVICE_DELETE_ALARM, 
-    SERVICE_DELETE_REMINDER,  
-    SERVICE_DELETE_ALL_ALARMS,  
-    SERVICE_DELETE_ALL_REMINDERS,  
-    SERVICE_DELETE_ALL,  
-    ATTR_DATETIME,
-    ATTR_MESSAGE,
-    ATTR_ALARM_ID,        
-    ATTR_REMINDER_ID,
-    ATTR_SNOOZE_MINUTES,
-    ATTR_MEDIA_PLAYER,
-    ATTR_NAME,
-    ATTR_NOTIFY_DEVICE,  
-    ATTR_NOTIFY_TITLE,      
-    ATTR_SPOTIFY_SOURCE,
-    ATTR_VOLUME,
-    DEFAULT_SNOOZE_MINUTES,
-    DEFAULT_NAME,
-    CONF_MEDIA_PLAYER,
-    CONF_ALLOWED_ACTIVATION_ENTITIES,
-    CONF_ENABLE_LLM,
-    CONF_ACTIVE_PRESS_MODE,
-    CONF_DEFAULT_SNOOZE_MINUTES,
-    DEFAULT_ENABLE_LLM,
-    ALARM_ENTITY_DOMAIN,
-    REMINDER_ENTITY_DOMAIN,
-)
+from .pixie_inventory import DeviceRecord, PixieInventory
+from .pixie_runtime import CloudParams, PixieAuthError, PixieAuthHandler, PixieRuntimeData
+from .pixie_value_profiles import hardware_list
 
-from .coordinator import AlarmAndReminderCoordinator
-from .media_player import MediaHandler
-from .intents import async_setup_intents
-from .llm_functions import async_setup_llm_api, async_cleanup_llm_api
-# from .sensor import async_setup_entry as async_setup_sensor_entry
-# sensor platform removed; scheduling moved to coordinator and switches
+LOGGER = logging.getLogger(__name__)
 
-__all__ = ["AlarmAndReminderCoordinator"]
+DOMAIN = "pixie_plus_local"
+MANUFACTURER = "SAL - Pixie Plus"
+INTEGRATION_TITLE = "Pixie Plus Local"
+PLATFORMS: tuple[str, ...] = ("light", "switch", "cover")
 
-_LOGGER = logging.getLogger(__name__)
+CONF_HOME_ID = "home_id"
+CONF_HOME_NAME = "home_name"
+CONF_USER_ID = "user_id"
+CONF_MESHNET = "meshnet"
+CONF_MESHNET2 = "meshnet2"
+CONF_NETID = "netid"
+CONF_INVENTORY_MODE = "inventory_mode"
+CONF_PIXIE_USERNAME = "pixie_username"
+CONF_PIXIE_PASSWORD = "pixie_password"
 
-REPEAT_OPTIONS = [
-    "once",
-    "daily",
-    "weekdays",
-    "weekends",
-    "custom",
-]
+INVENTORY_MODE_LOCAL_53216 = "local_53216"
+INVENTORY_MODE_CLOUD_FALLBACK = "cloud_fallback"
 
-REPEAT_DAY_OPTIONS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-SOUND_MEDIA_SCHEMA = vol.Schema(
-    {
-        vol.Required("media_content_id"): cv.string,
-        vol.Optional("media_content_type"): cv.string,
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-SOUND_INPUT_SCHEMA = vol.Any(SOUND_MEDIA_SCHEMA, cv.string)
+COORDINATOR_UPDATE_INTERVAL = timedelta(seconds=10)
+INVENTORY_STORE_VERSION = 1
 
 
-def _resolve_media_player_from_call(call: ServiceCall) -> str | None:
-    """Extract a single media player entity_id from a service call."""
-    candidate = call.data.get(ATTR_MEDIA_PLAYER)
-    target_entity: str | list | tuple | set | None = call.data.get(ATTR_ENTITY_ID)
+def _inventory_store(hass: HomeAssistant, entry: ConfigEntry) -> Store:
+    return Store(hass, INVENTORY_STORE_VERSION, f"{DOMAIN}_{entry.entry_id}_inventory")
 
-    # Handle nested payloads like {"entity_id": ...} from automations/scripts
-    if isinstance(candidate, dict):
-        if candidate.get("entity_id"):
-            candidate = candidate["entity_id"]
-        elif candidate.get("entity_ids"):
-            candidate = candidate["entity_ids"]
 
-    service_target = getattr(call, "target", None)
-    if not target_entity and service_target is not None:
-        entity_ids = getattr(service_target, "entity_id", None)
-        if entity_ids:
-            target_entity = entity_ids
-
-    # Some automation contexts store target entity ids under call.data["target"]
-    if not target_entity:
-        target_payload = call.data.get("target") if isinstance(call.data, dict) else None
-        if isinstance(target_payload, dict):
-            target_entity = target_payload.get("entity_id") or target_payload.get("entity_ids")
-
-    if target_entity:
-        if isinstance(target_entity, (list, tuple, set)):
-            filtered = [str(item).strip() for item in target_entity if item]
-            if len(filtered) > 1:
-                raise vol.Invalid("Select a single media player entity as the target.")
-            target_entity = filtered[0] if filtered else None
-        else:
-            target_entity = str(target_entity).strip()
-
-        if target_entity:
-            if candidate and str(candidate).strip() and str(candidate).strip() != target_entity:
-                raise vol.Invalid(
-                    "Specify the media player either via the media player target or the media_player field, not both."
-                )
-            candidate = target_entity
-
-    if isinstance(candidate, (list, tuple, set)):
-        candidate = next((str(item).strip() for item in candidate if item), None)
-
-    if not candidate:
-        # If other target selectors were used without an entity, warn so users pick an entity instead.
-        if any(call.data.get(key) for key in ("area_id", "device_id", "floor_id", "label_id")):
-            raise vol.Invalid(
-                "Select a specific media player entity for this service instead of an area, device, floor, or label."
-            )
+async def _async_load_inventory_snapshot(hass: HomeAssistant, entry: ConfigEntry) -> PixieInventory | None:
+    payload = await _inventory_store(hass, entry).async_load()
+    if not isinstance(payload, dict):
+        LOGGER.debug("No stored Pixie inventory snapshot found for entry %s", entry.entry_id)
         return None
-
-    candidate = str(candidate).strip()
-    if not candidate:
-        return None
-
-    if "." not in candidate:
-        candidate = f"media_player.{candidate}"
-
-    try:
-        return cv.entity_id(candidate)
-    except vol.Invalid as err:
-        raise vol.Invalid(f"Invalid media player entity: {candidate}") from err
-
-
-def _validate_target(call: ServiceCall) -> dict[str | None, str | None]:
-    """Extract media-player target information from a service call."""
-    _LOGGER.debug(
-        "validate_target call.data=%s target=%s target.entity_id=%s",
-        dict(call.data),
-        getattr(call, "target", None),
-        getattr(getattr(call, "target", None), "entity_id", None),
-    )
-    media_player = _resolve_media_player_from_call(call)
-    _LOGGER.debug("Validated target media_player=%s", media_player)
-    if media_player:
-        return {"media_player": media_player}
-    return {}
-
-
-def _normalize_target_mutation(call: ServiceCall, data: dict) -> None:
-    """Normalize optional target updates in mutable service payloads."""
-    media_player = _resolve_media_player_from_call(call)
-
-    if media_player:
-        data[ATTR_MEDIA_PLAYER] = media_player
-    elif ATTR_MEDIA_PLAYER in data and data[ATTR_MEDIA_PLAYER]:
-        try:
-            data[ATTR_MEDIA_PLAYER] = cv.entity_id(data[ATTR_MEDIA_PLAYER])
-        except vol.Invalid as err:
-            raise vol.Invalid(f"Invalid media player entity: {data[ATTR_MEDIA_PLAYER]}") from err
-    else:
-        data.pop(ATTR_MEDIA_PLAYER, None)
-
-    # Remove entity-based selectors we don't persist directly.
-    data.pop(ATTR_ENTITY_ID, None)
-    for key in ("area_id", "device_id", "floor_id", "label_id"):
-        data.pop(key, None)
-
-
-def _validate_activation_entity(value):
-    """Accept an entity ID or a target selector payload."""
-    if value in (None, ""):
-        return None
-
-    candidate = value
-    if isinstance(candidate, dict):
-        candidate = candidate.get("entity_id") or candidate.get("entity")
-
-    if isinstance(candidate, (list, tuple, set)):
-        candidate = next((item for item in candidate if item), None)
-
-    if candidate is None:
-        raise vol.Invalid("Select an entity for activation_entity or leave it blank")
-
-    candidate = str(candidate).strip()
-    if not candidate:
-        return None
-
-    try:
-        return cv.entity_id(candidate)
-    except vol.Invalid as err:
-        raise vol.Invalid(f"Invalid activation entity: {candidate}") from err
-
-
-def _validate_repeat(value):
-    """Normalize and validate repeat option."""
-    if value is None:
-        return None
-    normalized = str(value).strip().lower()
-    if not normalized:
-        return None
-    if normalized not in REPEAT_OPTIONS:
-        raise vol.Invalid(f"Invalid repeat option: {value}")
-    return normalized
-
-
-def _validate_repeat_days(value):
-    """Normalize and validate repeat_days input."""
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        items = value
-    else:
-        items = [value]
-
-    normalized: list[str] = []
-    for item in items:
-        if item is None:
-            continue
-        candidate = str(item).strip().lower()
-        if not candidate:
-            continue
-        if candidate not in REPEAT_DAY_OPTIONS:
-            raise vol.Invalid(f"Invalid repeat day: {item}")
-        normalized.append(candidate)
-    return normalized
-
-
-def _validate_volume(value):
-    """Normalize optional volume input to 0.0-1.0 range."""
-    if value in (None, ""):
+    snapshot = payload.get("inventory")
+    if not isinstance(snapshot, dict):
+        LOGGER.debug("Stored Pixie inventory snapshot is missing inventory data for entry %s", entry.entry_id)
         return None
     try:
-        number = float(value)
-    except (ValueError, TypeError):
-        raise vol.Invalid("Volume must be numeric") from None
-    if number < 0:
-        number = 0.0
-    if number <= 1:
-        return number
-    if number <= 100:
-        return min(1.0, number / 100.0)
-    return 1.0
-
-ALARM_ID_VALIDATOR = vol.Any(cv.entity_id, cv.string)
-REMINDER_ID_VALIDATOR = vol.Any(cv.entity_id, cv.string)
-
-SERVICE_RESCHEDULE_ALARM = "reschedule_alarm"
-SERVICE_RESCHEDULE_REMINDER = "reschedule_reminder"
-
-DEFAULT_ALARM_SOUND = "/media/local/Alarms/birds.mp3"
-DEFAULT_REMINDER_SOUND = "/media/local/Alarms/ringtone.mp3"
-
-async def _get_coordinator(hass: HomeAssistant) -> AlarmAndReminderCoordinator | None:
-    """Get the coordinator from hass.data."""
-    if DOMAIN in hass.data:
-        if "coordinator" in hass.data[DOMAIN]:
-            return hass.data[DOMAIN]["coordinator"]
-        for data in hass.data[DOMAIN].values():
-            if isinstance(data, dict) and "coordinator" in data:
-                return data["coordinator"]
-    _LOGGER.error("HA Alarm Clock coordinator not found")
-    return None
-
-
-async def _async_get_or_create_coordinator(hass: HomeAssistant) -> AlarmAndReminderCoordinator:
-    """Return the singleton coordinator, creating it if needed."""
-    domain_data = hass.data.setdefault(DOMAIN, {})
-
-    coordinator = domain_data.get("coordinator")
-    if coordinator:
-        return coordinator
-
-    for data in domain_data.values():
-        if isinstance(data, dict) and "coordinator" in data:
-            coordinator = data["coordinator"]
-            domain_data["coordinator"] = coordinator
-            return coordinator
-
-    media_handler = MediaHandler(
-        hass,
-        DEFAULT_ALARM_SOUND,
-        DEFAULT_REMINDER_SOUND,
-    )
-    coordinator = AlarmAndReminderCoordinator(hass, media_handler)
-    domain_data["coordinator"] = coordinator
-    return coordinator
-
-
-PLATFORMS = ["switch"]
-
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the HA Alarm Clock integration (minimal)."""
-    # Only initialize the top-level data container here.
-    hass.data.setdefault(DOMAIN, {})
-    # return True
-
-    try:
-        # Initialize data structure
-        hass.data.setdefault(DOMAIN, {})
-
-        coordinator = await _async_get_or_create_coordinator(hass)
-
-        # Initialize the DOMAIN data structure
-        hass.data[DOMAIN].setdefault("entities", [])  # Initialize the entities list
-
-    # Dynamic schema based on available media players
-        ALARM_SERVICE_SCHEMA = vol.Schema({
-            vol.Optional("time"): cv.time,
-            vol.Optional("date"): cv.date,
-            vol.Optional(ATTR_NAME): str,  # Optional name for alarms
-            vol.Optional(ATTR_MESSAGE): cv.string,
-            vol.Optional(ATTR_MEDIA_PLAYER): cv.entity_id,
-            vol.Optional("announce_time", default=True): cv.boolean,
-            vol.Optional("announce_name", default=True): cv.boolean,
-            vol.Optional("activation_entity"): _validate_activation_entity,
-            vol.Optional("repeat", default="once"): vol.In(REPEAT_OPTIONS),
-            vol.Optional("repeat_days"): vol.All(
-                cv.ensure_list,
-                [vol.In(["mon", "tue", "wed", "thu", "fri", "sat", "sun"])]
-            ),
-            vol.Optional("sound_media"): SOUND_INPUT_SCHEMA,
-            vol.Optional("sound_file"): cv.string,
-            vol.Optional(ATTR_SPOTIFY_SOURCE): cv.string,
-            vol.Optional(ATTR_NOTIFY_DEVICE): vol.Any(
-                cv.string,  # Single device
-                vol.All(cv.ensure_list, [cv.string])  # List of devices
-            ),
-            vol.Optional(ATTR_VOLUME): _validate_volume,
-        })
-
-        REMINDER_SERVICE_SCHEMA = vol.Schema({
-            vol.Optional("time"): cv.time,
-            vol.Required(ATTR_NAME): str,  # Required name for reminders
-            vol.Optional("date"): cv.date,
-            vol.Optional(ATTR_MESSAGE): cv.string,
-            vol.Optional(ATTR_MEDIA_PLAYER): cv.entity_id,
-            vol.Optional("announce_time", default=True): cv.boolean,
-            vol.Optional("announce_name", default=True): cv.boolean,
-            vol.Optional("activation_entity"): _validate_activation_entity,
-            vol.Optional("repeat", default="once"): vol.In(REPEAT_OPTIONS),
-            vol.Optional("repeat_days"): vol.All(
-                cv.ensure_list,
-                [vol.In(["mon", "tue", "wed", "thu", "fri", "sat", "sun"])]
-            ),
-            vol.Optional("sound_media"): SOUND_INPUT_SCHEMA,
-            vol.Optional("sound_file"): cv.string,
-            vol.Optional(ATTR_SPOTIFY_SOURCE): cv.string,
-            vol.Optional(ATTR_NOTIFY_DEVICE): vol.Any(
-                 cv.string,  # Single device
-                vol.All(cv.ensure_list, [cv.string])  # List of devices
-            ),
-            vol.Optional(ATTR_VOLUME): _validate_volume,
-        })
-
-        # Store coordinator for future access
-        hass.data[DOMAIN]["coordinator"] = coordinator
-
-        async def async_schedule_alarm(call: ServiceCall):
-            """Handle the alarm service call."""
-            target = _validate_target(call)
-            await coordinator.schedule_item(call, is_alarm=True, target=target)
-
-        async def async_schedule_reminder(call: ServiceCall):
-            """Handle the reminder service call."""
-            target = _validate_target(call)
-            await coordinator.schedule_item(call, is_alarm=False, target=target)
-
-        # Register services with updated schema
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_ALARM,
-            async_schedule_alarm,
-            schema=ALARM_SERVICE_SCHEMA,
+        inventory = PixieInventory.from_dict(snapshot)
+        LOGGER.debug(
+            "Restored Pixie inventory snapshot for entry %s: home=%s devices=%s",
+            entry.entry_id,
+            inventory.home_id,
+            len(inventory.devices_by_id),
         )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SET_REMINDER,
-            async_schedule_reminder,
-            schema=REMINDER_SERVICE_SCHEMA,
-        )
-
-        websocket_api.async_register_command(hass, websocket_resolve_media_metadata)
-
-        # Register reminder-specific services
-        async def async_stop_reminder(call: ServiceCall):
-            """Handle stop reminder service call."""
-            try:
-                reminder_id = call.data.get(ATTR_REMINDER_ID)
-                coordinator = await _get_coordinator(hass)
-                if coordinator:
-                    _LOGGER.debug("Found coordinator. Active items: %s", coordinator._active_items)
-                    await coordinator.stop_item(reminder_id, is_alarm=False)
-            except Exception as err:
-                _LOGGER.error("Error stopping reminder: %s", err, exc_info=True)
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_STOP_REMINDER,
-            async_stop_reminder,
-            schema=vol.Schema({
-                vol.Required(ATTR_REMINDER_ID): REMINDER_ID_VALIDATOR,
-            }),
-        )
-
-        async def async_stop_alarm(call: ServiceCall):
-            """Handle stop alarm service call."""
-            alarm_id = call.data.get("alarm_id")
-            await coordinator.stop_item(alarm_id, is_alarm=True)
-
-        # Register alarm control services
-        hass.services.async_register(
-            DOMAIN,
-            "stop_alarm",
-            async_stop_alarm,
-            schema=vol.Schema({
-                vol.Required("alarm_id"): ALARM_ID_VALIDATOR,
-            }),
-        )
-
-        # Register new services
-        hass.services.async_register(
-            DOMAIN,
-            "stop_all_alarms",
-            async_stop_all_alarms,
-            schema=vol.Schema({}),
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            "stop_all_reminders",
-            async_stop_all_reminders,
-            schema=vol.Schema({}),
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            "stop_all",
-            async_stop_all,
-            schema=vol.Schema({}),
-        )
-
-        async def async_edit_alarm(call: ServiceCall):
-            """Handle edit alarm service call."""
-            try:
-                # Create a mutable copy of the data
-                data = dict(call.data)
-                _normalize_target_mutation(call, data)
-                alarm_id = data.pop("alarm_id")
-                
-                coordinator = None
-                for entry_id, data_entry in hass.data[DOMAIN].items():
-                    if isinstance(data_entry, dict) and "coordinator" in data_entry:
-                        coordinator = data_entry["coordinator"]
-                        break
-                
-                if coordinator:
-                    await coordinator.edit_item(alarm_id, data, is_alarm=True)
-                
-            except HomeAssistantError as err:
-                _LOGGER.error("Error editing alarm: %s", err)
-                raise
-            except Exception as err:
-                _LOGGER.error("Error editing alarm: %s", err, exc_info=True)
-                raise HomeAssistantError("Failed to edit alarm") from err
-
-        async def async_edit_reminder(call: ServiceCall):
-            """Handle edit reminder service call."""
-            try:
-                # Create a mutable copy of the data
-                data = dict(call.data)
-                _normalize_target_mutation(call, data)
-                reminder_id = data.pop("reminder_id")
-                
-                coordinator = None
-                for entry_id, data_entry in hass.data[DOMAIN].items():
-                    if isinstance(data_entry, dict) and "coordinator" in data_entry:
-                        coordinator = data_entry["coordinator"]
-                        break
-                
-                if coordinator:
-                    await coordinator.edit_item(reminder_id, data, is_alarm=False)
-                
-            except HomeAssistantError as err:
-                _LOGGER.error("Error editing reminder: %s", err)
-                raise
-            except Exception as err:
-                _LOGGER.error("Error editing reminder: %s", err, exc_info=True)
-                raise HomeAssistantError("Failed to edit reminder") from err
-
-        # Register edit services
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_EDIT_ALARM,
-            async_edit_alarm,
-            schema=vol.Schema({
-                vol.Required("alarm_id"): ALARM_ID_VALIDATOR,
-                vol.Optional("time"): cv.time,
-                vol.Optional("date"): cv.date,
-                vol.Optional("name"): cv.string,
-                vol.Optional("message"): cv.string,
-                vol.Optional("media_player"): cv.entity_id,
-                vol.Optional("announce_time"): cv.boolean,
-                vol.Optional("announce_name"): cv.boolean,
-                vol.Optional("activation_entity"): _validate_activation_entity,
-                vol.Optional("repeat"): _validate_repeat,
-                vol.Optional("repeat_days"): _validate_repeat_days,
-                vol.Optional(ATTR_SPOTIFY_SOURCE): cv.string,
-                vol.Optional(ATTR_VOLUME): _validate_volume,
-            }, extra=vol.ALLOW_EXTRA),
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_EDIT_REMINDER,
-            async_edit_reminder,
-            schema=vol.Schema({
-                vol.Required("reminder_id"): REMINDER_ID_VALIDATOR,
-                vol.Optional("time"): cv.time,
-                vol.Optional("date"): cv.date,
-                vol.Optional("name"): cv.string,
-                vol.Optional("message"): cv.string,
-                vol.Optional("media_player"): cv.entity_id,
-                vol.Optional("announce_time"): cv.boolean,
-                vol.Optional("announce_name"): cv.boolean,
-                vol.Optional("activation_entity"): _validate_activation_entity,
-                vol.Optional("repeat"): _validate_repeat,
-                vol.Optional("repeat_days"): _validate_repeat_days,
-                vol.Optional(ATTR_VOLUME): _validate_volume,
-            }, extra=vol.ALLOW_EXTRA),
-        )
-
-        # Set up intents
-        if DOMAIN not in hass.data:
-            hass.data[DOMAIN] = {}
-            await async_setup_intents(hass)  # Only setup intents once
-
-        # Register delete services at the end of async_setup
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_DELETE_ALARM,
-            async_delete_alarm,
-            schema=vol.Schema({
-                vol.Required("alarm_id"): ALARM_ID_VALIDATOR,
-            })
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_DELETE_REMINDER,
-            async_delete_reminder,
-            schema=vol.Schema({
-                vol.Required("reminder_id"): REMINDER_ID_VALIDATOR,
-            })
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_DELETE_ALL_ALARMS,
-            async_delete_all_alarms,
-            schema=vol.Schema({})
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_DELETE_ALL_REMINDERS,
-            async_delete_all_reminders,
-            schema=vol.Schema({})
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_DELETE_ALL,
-            async_delete_all,
-            schema=vol.Schema({})
-        )
-
-        async def async_snooze_alarm(call: ServiceCall) -> None:
-            """Handle snooze alarm service call."""
-            try:
-                alarm_id = call.data.get("alarm_id")
-                minutes = call.data.get("minutes")
-                coordinator = None
-                
-                for entry_id, data in hass.data[DOMAIN].items():
-                    if isinstance(data, dict) and "coordinator" in data:
-                        coordinator = data["coordinator"]
-                        break
-                
-                if coordinator:
-                    default_minutes = coordinator.get_default_snooze_minutes()
-                    duration = minutes if minutes is not None else default_minutes
-                    await coordinator.snooze_item(alarm_id, int(duration), is_alarm=True)
-                else:
-                    _LOGGER.error("No coordinator found")
-                    
-            except Exception as err:
-                _LOGGER.error("Error snoozing alarm: %s", err, exc_info=True)
-
-        async def async_snooze_reminder(call: ServiceCall) -> None:
-            """Handle snooze reminder service call."""
-            try:
-                reminder_id = call.data.get("reminder_id")
-                minutes = call.data.get("minutes")
-                coordinator = None
-                
-                for entry_id, data in hass.data[DOMAIN].items():
-                    if isinstance(data, dict) and "coordinator" in data:
-                        coordinator = data["coordinator"]
-                        break
-                
-                if coordinator:
-                    default_minutes = coordinator.get_default_snooze_minutes()
-                    duration = minutes if minutes is not None else default_minutes
-                    await coordinator.snooze_item(reminder_id, int(duration), is_alarm=False)
-                else:
-                    _LOGGER.error("No coordinator found")
-                    
-            except Exception as err:
-                _LOGGER.error("Error snoozing reminder: %s", err, exc_info=True)
-
-        # Register snooze services
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SNOOZE_ALARM,
-            async_snooze_alarm,
-            schema=vol.Schema({
-                vol.Required("alarm_id"): ALARM_ID_VALIDATOR,
-                vol.Optional("minutes"): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=60)
-                ),
-            })
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_SNOOZE_REMINDER,
-            async_snooze_reminder,
-            schema=vol.Schema({
-                vol.Required("reminder_id"): REMINDER_ID_VALIDATOR,
-                vol.Optional("minutes"): vol.All(
-                    vol.Coerce(int), vol.Range(min=1, max=60)
-                ),
-            })
-        )
-
-        async def async_reschedule_alarm(call: ServiceCall) -> None:
-            """Handle reschedule alarm service call."""
-            try:
-                alarm_id = call.data.get("alarm_id")
-                changes = {k: v for k, v in call.data.items() if k != "alarm_id"}
-                _normalize_target_mutation(call, changes)
-                
-                coordinator = None
-                for entry_id, data in hass.data[DOMAIN].items():
-                    if isinstance(data, dict) and "coordinator" in data:
-                        coordinator = data["coordinator"]
-                        break
-                
-                if coordinator:
-                    await coordinator.reschedule_item(alarm_id, changes, is_alarm=True)
-                else:
-                    _LOGGER.error("No coordinator found")
-                    
-            except Exception as err:
-                _LOGGER.error("Error rescheduling alarm: %s", err, exc_info=True)
-
-        async def async_reschedule_reminder(call: ServiceCall) -> None:
-            """Handle reschedule reminder service call."""
-            try:
-                reminder_id = call.data.get("reminder_id")
-                changes = {k: v for k, v in call.data.items() if k != "reminder_id"}
-                _normalize_target_mutation(call, changes)
-                
-                coordinator = None
-                for entry_id, data in hass.data[DOMAIN].items():
-                    if isinstance(data, dict) and "coordinator" in data:
-                        coordinator = data["coordinator"]
-                        break
-                
-                if coordinator:
-                    await coordinator.reschedule_item(reminder_id, changes, is_alarm=False)
-                else:
-                    _LOGGER.error("No coordinator found")
-                    
-            except Exception as err:
-                _LOGGER.error("Error rescheduling reminder: %s", err, exc_info=True)
-
-        # Register new services
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESCHEDULE_ALARM,
-            async_reschedule_alarm,
-            schema=vol.Schema({
-                vol.Required("alarm_id"): ALARM_ID_VALIDATOR,
-                vol.Optional("time"): cv.time,
-                vol.Optional("date"): cv.date,
-                vol.Optional("message"): cv.string,
-                vol.Optional("media_player"): cv.entity_id,
-                vol.Optional("announce_time"): cv.boolean,
-                vol.Optional("activation_entity"): _validate_activation_entity,
-                vol.Optional("repeat"): _validate_repeat,
-                vol.Optional("repeat_days"): _validate_repeat_days,
-                vol.Optional(ATTR_VOLUME): _validate_volume,
-            }, extra=vol.ALLOW_EXTRA),
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_RESCHEDULE_REMINDER,
-            async_reschedule_reminder,
-            schema=vol.Schema({
-                vol.Required("reminder_id"): REMINDER_ID_VALIDATOR,
-                vol.Optional("time"): cv.time,
-                vol.Optional("date"): cv.date,
-                vol.Optional("message"): cv.string,
-                vol.Optional("media_player"): cv.entity_id,
-                vol.Optional("announce_time"): cv.boolean,
-                vol.Optional("activation_entity"): _validate_activation_entity,
-                vol.Optional("repeat"): _validate_repeat,
-                vol.Optional("repeat_days"): _validate_repeat_days,
-                vol.Optional(ATTR_VOLUME): _validate_volume,
-            }, extra=vol.ALLOW_EXTRA),
-        )
-
-        return True
-
+        return inventory
     except Exception as err:
-        _LOGGER.error("Error setting up integration: %s", err, exc_info=True)
-        return False
+        LOGGER.warning("Could not restore Pixie inventory snapshot: %s", err)
+        return None
+
+
+async def _async_save_inventory_snapshot(hass: HomeAssistant, entry: ConfigEntry, inventory: PixieInventory | None) -> None:
+    if inventory is None:
+        return
+    await _inventory_store(hass, entry).async_save({"inventory": inventory.to_dict()})
+    LOGGER.debug(
+        "Saved Pixie inventory snapshot for entry %s: home=%s devices=%s",
+        entry.entry_id,
+        inventory.home_id,
+        len(inventory.devices_by_id),
+    )
+
+
+def _entry_inventory_mode(entry: ConfigEntry) -> str:
+    mode = str(entry.data.get(CONF_INVENTORY_MODE) or INVENTORY_MODE_LOCAL_53216)
+    resolved_mode = mode if mode in (INVENTORY_MODE_LOCAL_53216, INVENTORY_MODE_CLOUD_FALLBACK) else INVENTORY_MODE_LOCAL_53216
+    if resolved_mode != mode:
+        LOGGER.debug("Unknown Pixie inventory mode '%s', defaulting to %s", mode, resolved_mode)
+    return resolved_mode
+
+
+def _entry_username(entry: ConfigEntry) -> str:
+    return str(entry.data.get(CONF_PIXIE_USERNAME) or "")
+
+
+def _entry_password(entry: ConfigEntry) -> str:
+    return str(entry.data.get(CONF_PIXIE_PASSWORD) or "")
+
+
+async def _async_update_entry_runtime_data(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    cloud_params: CloudParams,
+    *,
+    inventory_mode: str,
+    username: str,
+    password: str,
+) -> None:
+    data = dict(entry.data)
+    data.update(
+        {
+            CONF_HOME_ID: cloud_params.home_id,
+            CONF_HOME_NAME: cloud_params.home_name,
+            CONF_USER_ID: cloud_params.user_id,
+            CONF_MESHNET: cloud_params.meshnet,
+            CONF_MESHNET2: cloud_params.meshnet2,
+            CONF_NETID: cloud_params.netid,
+            CONF_INVENTORY_MODE: inventory_mode,
+        }
+    )
+    if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+        data[CONF_PIXIE_USERNAME] = username
+        data[CONF_PIXIE_PASSWORD] = password
+    else:
+        data.pop(CONF_PIXIE_USERNAME, None)
+        data.pop(CONF_PIXIE_PASSWORD, None)
+    hass.config_entries.async_update_entry(entry, data=data)
+    LOGGER.debug(
+        "Updated Pixie config entry %s for inventory mode %s%s",
+        entry.entry_id,
+        inventory_mode,
+        " with stored credentials" if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK else " without stored credentials",
+    )
+
+
+@dataclass(frozen=True)
+class PixieEndpoint:
+    """Represents one Home Assistant entity endpoint."""
+
+    device_id: int
+    endpoint_key: str
+    command_target: str
+    entity_unique_id: str
+    device_identifier: str
+    device_name: str | None
+    via_device_identifier: str | None
+    entity_name: str | None = None
+    entity_translation_key: str | None = None
+    device_translation_key: str | None = None
+
+
+def gateway_device_identifier(inventory: PixieInventory) -> str:
+    """Return the stable gateway device identifier."""
+    gateway = inventory.gateway
+    if gateway is not None:
+        if gateway.gateway_id:
+            return f"gateway:{gateway.gateway_id}"
+        if gateway.gateway_mac:
+            return f"gateway:{gateway.gateway_mac}"
+    return f"gateway:home:{inventory.home_id}"
+
+
+def physical_device_identifier(record: DeviceRecord) -> str:
+    """Return the stable identifier for one physical device."""
+    if record.mac:
+        return f"device:{record.mac}"
+    return f"device:id:{record.id}"
+
+
+def child_device_identifier(record: DeviceRecord, endpoint_key: str) -> str:
+    """Return the stable identifier for one child endpoint device."""
+    return f"{physical_device_identifier(record)}:{endpoint_key}"
+
+
+def endpoint_unique_identifier(record: DeviceRecord, endpoint_key: str) -> str:
+    """Return the stable unique identifier for one entity endpoint."""
+    if endpoint_key == "main":
+        return physical_device_identifier(record)
+    return child_device_identifier(record, endpoint_key)
+
+
+async def async_register_device_topology(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    inventory: PixieInventory | None,
+    *,
+    domain: str,
+) -> None:
+    """Register the gateway and physical devices in the device registry."""
+    if inventory is None:
+        return
+
+    device_registry = dr.async_get(hass)
+    gateway_identifier = gateway_device_identifier(inventory)
+    gateway = inventory.gateway
+    gateway_kwargs = {
+        "config_entry_id": entry.entry_id,
+        "identifiers": {(domain, gateway_identifier)},
+        "manufacturer": MANUFACTURER,
+        "name": gateway.model_name or "Pixie Gateway" if gateway else "Pixie Gateway",
+        "model": gateway.model_name if gateway else "Pixie Gateway",
+        "model_id": gateway.model_no if gateway else None,
+    }
+    device_registry.async_get_or_create(**gateway_kwargs)
+
+    for record in inventory.devices_by_id.values():
+        if record.model_no == "0102":
+            continue
+
+        kwargs = {
+            "config_entry_id": entry.entry_id,
+            "identifiers": {(domain, physical_device_identifier(record))},
+            "manufacturer": MANUFACTURER,
+            "name": record.name,
+            "model": hardware_list.get(record.model_no, record.model_no),
+            "model_id": record.model_no,
+            "via_device": (domain, gateway_identifier),
+        }
+        if record.version is not None:
+            kwargs["sw_version"] = str(record.version)
+        device_registry.async_get_or_create(**kwargs)
+
+
+class PixiePlusCoordinatorEntity(CoordinatorEntity[PixieInventory]):
+    """Shared base entity for Pixie Plus Local platforms."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(self, runtime_data, endpoint: PixieEndpoint, *, domain: str) -> None:
+        """Initialize the shared base entity."""
+        super().__init__(runtime_data.coordinator)
+        self.runtime_data = runtime_data
+        self.endpoint = endpoint
+        self.domain = domain
+        self._attr_unique_id = endpoint.entity_unique_id
+        self._attr_name = endpoint.entity_name
+        self._attr_translation_key = endpoint.entity_translation_key
+
+    @property
+    def record(self) -> DeviceRecord:
+        """Return the live device record from the shared inventory."""
+        return self.coordinator.data.devices_by_id[self.endpoint.device_id]
+
+    @property
+    def available(self) -> bool:
+        """Return whether the entity is currently available."""
+        runtime_session = self.runtime_data.pixie_runtime.runtime_session
+        if runtime_session is None or not runtime_session.is_alive():
+            return False
+        return self.record.runtime.presence == "online"
+
+    @property
+    def device_info(self):
+        """Return the device registry info for this entity's device."""
+        record = self.record
+        info = {
+            "identifiers": {(self.domain, self.endpoint.device_identifier)},
+            "manufacturer": MANUFACTURER,
+            "model": hardware_list.get(record.model_no, record.model_no),
+            "model_id": record.model_no,
+        }
+        if self.endpoint.device_name is not None:
+            info["name"] = self.endpoint.device_name
+        if self.endpoint.device_translation_key is not None:
+            info["translation_key"] = self.endpoint.device_translation_key
+        if self.endpoint.via_device_identifier is not None:
+            info["via_device"] = (self.domain, self.endpoint.via_device_identifier)
+        if record.version is not None:
+            info["sw_version"] = str(record.version)
+        return info
+
+
+class PixiePlusRuntimeCoordinator(DataUpdateCoordinator[PixieInventory]):
+    """Expose the in-memory Pixie runtime inventory to HA entities."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        pixie_runtime: PixieRuntimeData,
+    ) -> None:
+        super().__init__(
+            hass,
+            LOGGER,
+            config_entry=entry,
+            name=DOMAIN,
+            update_interval=COORDINATOR_UPDATE_INTERVAL,
+            always_update=True,
+        )
+        self.pixie_runtime = pixie_runtime
+        self.runtime_manager: PixiePlusConfigEntryRuntimeData | None = None
+
+    async def _async_update_data(self) -> PixieInventory:
+        """Return the current runtime inventory snapshot."""
+        if self.runtime_manager is not None:
+            try:
+                await self.runtime_manager.async_ensure_runtime(self.hass, reason="coordinator_refresh")
+            except Exception as err:
+                raise UpdateFailed(f"Pixie runtime unavailable: {err}") from err
+
+        inventory = self.pixie_runtime.inventory
+        if inventory is None:
+            raise UpdateFailed("Pixie runtime inventory is not initialized")
+
+        runtime_session = self.pixie_runtime.runtime_session
+        if runtime_session is not None and not runtime_session.is_alive() and runtime_session.error is not None:
+            raise UpdateFailed(f"Pixie gateway runtime stopped: {runtime_session.error}") from runtime_session.error
+
+        return inventory
+
+
+@dataclass
+class PixiePlusConfigEntryRuntimeData:
+    """Objects stored in ConfigEntry.runtime_data."""
+
+    handler: PixieAuthHandler
+    cloud_params: CloudParams
+    pixie_runtime: PixieRuntimeData
+    coordinator: PixiePlusRuntimeCoordinator
+    entry: ConfigEntry
+    restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    @staticmethod
+    def _describe_runtime_session(runtime_session) -> str:
+        """Return a compact runtime-session status string for logs."""
+        if runtime_session is None:
+            return "missing"
+
+        summary = runtime_session.health_summary()
+        parts = [
+            f"alive={summary['alive']}",
+            f"primed={summary['primed']}",
+            f"closed={summary['connection_closed']}",
+            f"hb_failures={summary['consecutive_heartbeat_failures']}",
+        ]
+        if summary["error"]:
+            parts.append(f"error={summary['error']}")
+        return ", ".join(parts)
+
+    def push_inventory_update_from_thread(self, inventory: PixieInventory) -> None:
+        """Push a runtime inventory update to HA from the TCP worker thread."""
+        self.pixie_runtime.inventory = inventory
+        self.coordinator.hass.loop.call_soon_threadsafe(
+            self.coordinator.async_set_updated_data,
+            inventory,
+        )
+        self.coordinator.hass.loop.call_soon_threadsafe(
+            self.coordinator.hass.async_create_task,
+            _async_save_inventory_snapshot(self.coordinator.hass, self.entry, inventory),
+        )
+
+    async def async_ensure_runtime(self, hass: HomeAssistant, *, reason: str):
+        """Ensure there is one healthy live runtime session for this config entry."""
+        runtime_session = self.pixie_runtime.runtime_session
+        if runtime_session is not None and runtime_session.is_alive() and not runtime_session.needs_restart():
+            return runtime_session
+
+        async with self.restart_lock:
+            runtime_session = self.pixie_runtime.runtime_session
+            if runtime_session is not None and runtime_session.is_alive() and not runtime_session.needs_restart():
+                return runtime_session
+
+            if runtime_session is not None:
+                LOGGER.warning(
+                    "Restarting Pixie runtime (%s): %s",
+                    reason,
+                    self._describe_runtime_session(runtime_session),
+                )
+                await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
+            else:
+                LOGGER.info("Starting Pixie runtime (%s)", reason)
+
+            restart_handler = PixieAuthHandler()
+            restart_handler.inventory = self.pixie_runtime.inventory
+            restart_handler.gateway_identity = self.pixie_runtime.inventory.gateway if self.pixie_runtime.inventory else None
+            restart_handler.set_inventory_update_callback(self.push_inventory_update_from_thread)
+
+            username = _entry_username(self.entry)
+            password = _entry_password(self.entry)
+            inventory_mode = _entry_inventory_mode(self.entry)
+
+            try:
+                restarted_runtime = await restart_handler.async_bootstrap_gateway(
+                    self.cloud_params,
+                    username=username,
+                    password=password,
+                    keep_control_alive=True,
+                    wait_for_shutdown=False,
+                    hydrate_inventory=False,
+                )
+            except Exception:
+                restart_session = restart_handler.runtime_session
+                if restart_session is not None:
+                    await hass.async_add_executor_job(restart_session.stop_and_join, 5.0)
+                raise
+
+            if restarted_runtime.runtime_session is None:
+                raise ConfigEntryError("Pixie runtime restart completed without a live session")
+
+            self.handler = restart_handler
+            self.pixie_runtime.handler = restart_handler
+            self.pixie_runtime.runtime_session = restarted_runtime.runtime_session
+            self.pixie_runtime.inventory_mode = inventory_mode
+            if restarted_runtime.inventory is not None:
+                self.pixie_runtime.inventory = restarted_runtime.inventory
+
+            LOGGER.info(
+                "Pixie runtime ready after %s: %s",
+                reason,
+                self._describe_runtime_session(self.pixie_runtime.runtime_session),
+            )
+            return self.pixie_runtime.runtime_session
+
+    async def async_shutdown(self, hass: HomeAssistant) -> None:
+        """Stop the long-lived gateway runtime session."""
+        async with self.restart_lock:
+            runtime_session = self.pixie_runtime.runtime_session
+            if runtime_session is None:
+                return
+
+            await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
+
+    async def async_send_local_command(self, hass: HomeAssistant, **kwargs) -> None:
+        """Send a local command using the single shared 41578 runtime session."""
+        runtime_session = await self.async_ensure_runtime(hass, reason="command_send")
+        try:
+            await hass.async_add_executor_job(runtime_session.send_command, dict(kwargs))
+            self.coordinator.async_set_updated_data(self.pixie_runtime.inventory)
+            return
+        except Exception as err:
+            runtime_unhealthy = (
+                not runtime_session.is_alive()
+                or runtime_session.needs_restart()
+                or runtime_session.connection_closed_at is not None
+            )
+            if runtime_unhealthy:
+                LOGGER.warning("Live Pixie runtime command failed; restarting shared runtime: %s", err)
+                recovered_session = await self.async_ensure_runtime(
+                    hass,
+                    reason="command_send_recovery",
+                )
+                await hass.async_add_executor_job(recovered_session.send_command, dict(kwargs))
+                self.coordinator.async_set_updated_data(self.pixie_runtime.inventory)
+                return
+
+            LOGGER.warning("Live Pixie runtime command failed on shared runtime: %s", err)
+            raise
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up the Pixie Plus Local integration."""
+    return True
+
+
+def _cloud_params_from_entry(entry: ConfigEntry) -> CloudParams:
+    """Build bootstrap cloud parameters from persisted config-entry data."""
+    missing = [
+        key
+        for key in (CONF_HOME_ID, CONF_USER_ID, CONF_MESHNET, CONF_MESHNET2, CONF_NETID)
+        if not entry.data.get(key)
+    ]
+    if missing:
+        raise ConfigEntryError(
+            "Config entry is missing required Pixie runtime fields: " + ", ".join(sorted(missing))
+        )
+
+    return CloudParams(
+        home_id=str(entry.data[CONF_HOME_ID]),
+        home_name=str(entry.data.get(CONF_HOME_NAME) or entry.title or INTEGRATION_TITLE),
+        user_id=str(entry.data[CONF_USER_ID]),
+        meshnet=str(entry.data[CONF_MESHNET]),
+        meshnet2=str(entry.data[CONF_MESHNET2]),
+        netid=str(entry.data[CONF_NETID]),
+    )
+
+
+async def _async_build_runtime_data(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+) -> PixiePlusConfigEntryRuntimeData:
+    """Bootstrap the Pixie local runtime and its HA coordinator."""
+    cloud_params = _cloud_params_from_entry(entry)
+    inventory_mode = _entry_inventory_mode(entry)
+    persisted_inventory = await _async_load_inventory_snapshot(hass, entry)
+    username = _entry_username(entry)
+    password = _entry_password(entry)
+
+    LOGGER.debug(
+        "Bootstrapping Pixie entry %s in %s mode%s",
+        entry.entry_id,
+        inventory_mode,
+        " with stored inventory snapshot available" if persisted_inventory is not None else " with no stored inventory snapshot",
+    )
+
+    handler = PixieAuthHandler()
+    coordinator: PixiePlusRuntimeCoordinator | None = None
+
+    async def _shutdown_runtime() -> None:
+        runtime_session = handler.runtime_session
+        if runtime_session is not None:
+            await hass.async_add_executor_job(runtime_session.stop_and_join, 5.0)
+
+    try:
+        if inventory_mode == INVENTORY_MODE_CLOUD_FALLBACK:
+            LOGGER.warning(
+                "Pixie Plus Local is using cloud-assisted inventory mode because direct local inventory was unavailable during setup"
+            )
+            if not username or not password:
+                raise ConfigEntryError("Cloud fallback mode requires stored Pixie credentials")
+            try:
+                LOGGER.debug("Refreshing Pixie inventory from cloud for entry %s", entry.entry_id)
+                refreshed_cloud_params = await handler.async_fetch_cloud_params(
+                    username,
+                    password,
+                    include_inventory_seed=True,
+                )
+                cloud_params = refreshed_cloud_params
+                await _async_update_entry_runtime_data(
+                    hass,
+                    entry,
+                    cloud_params,
+                    inventory_mode=INVENTORY_MODE_CLOUD_FALLBACK,
+                    username=username,
+                    password=password,
+                )
+            except Exception as err:
+                if persisted_inventory is None:
+                    raise ConfigEntryNotReady(f"Pixie cloud refresh failed and no stored inventory is available: {err}") from err
+                LOGGER.warning("Pixie cloud refresh failed; using stored inventory snapshot: %s", err)
+                handler.inventory = persisted_inventory
+                handler.gateway_identity = persisted_inventory.gateway
+
+            pixie_runtime = await handler.async_bootstrap_gateway(
+                cloud_params,
+                username=username,
+                password=password,
+                keep_control_alive=True,
+                wait_for_shutdown=False,
+                hydrate_inventory=False,
+            )
+            pixie_runtime.inventory_mode = INVENTORY_MODE_CLOUD_FALLBACK
+            if pixie_runtime.inventory is None:
+                pixie_runtime.inventory = handler.inventory
+            LOGGER.debug("Pixie entry %s using cloud-assisted inventory mode", entry.entry_id)
+        else:
+            LOGGER.debug("Trying direct local Pixie inventory startup for entry %s", entry.entry_id)
+            pixie_runtime = await handler.async_bootstrap_gateway(
+                cloud_params,
+                username="",
+                password="",
+                keep_control_alive=True,
+                wait_for_shutdown=False,
+            )
+            pixie_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
+            if pixie_runtime.inventory is None:
+                if persisted_inventory is None:
+                    raise ConfigEntryNotReady("Pixie startup inventory unavailable and no stored inventory snapshot exists")
+                LOGGER.warning("Direct local Pixie inventory startup failed; using stored inventory snapshot")
+                await _shutdown_runtime()
+                handler = PixieAuthHandler()
+                handler.inventory = persisted_inventory
+                handler.gateway_identity = persisted_inventory.gateway
+                pixie_runtime = await handler.async_bootstrap_gateway(
+                    cloud_params,
+                    username="",
+                    password="",
+                    keep_control_alive=True,
+                    wait_for_shutdown=False,
+                    hydrate_inventory=False,
+                )
+                pixie_runtime.inventory = persisted_inventory
+                pixie_runtime.inventory_mode = INVENTORY_MODE_LOCAL_53216
+            else:
+                LOGGER.debug("Direct local Pixie inventory startup succeeded for entry %s", entry.entry_id)
+
+        coordinator = PixiePlusRuntimeCoordinator(hass, entry, pixie_runtime)
+        handler.set_inventory_update_callback(
+            lambda inventory: hass.loop.call_soon_threadsafe(coordinator.async_set_updated_data, inventory)
+        )
+        await coordinator.async_config_entry_first_refresh()
+        await _async_save_inventory_snapshot(hass, entry, pixie_runtime.inventory)
+    except PixieAuthError as err:
+        await _shutdown_runtime()
+        raise ConfigEntryNotReady(str(err)) from err
+    except Exception:
+        await _shutdown_runtime()
+        raise
+
+    runtime_data = PixiePlusConfigEntryRuntimeData(
+        handler=handler,
+        cloud_params=cloud_params,
+        pixie_runtime=pixie_runtime,
+        coordinator=coordinator,
+        entry=entry,
+    )
+    coordinator.runtime_manager = runtime_data
+    return runtime_data
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up a config entry: create/store coordinator and forward platforms."""
-    try:
-        hass.data.setdefault(DOMAIN, {})
-        # Ensure per-entry container
-        hass.data[DOMAIN].setdefault(entry.entry_id, {})
-        entry_store = hass.data[DOMAIN][entry.entry_id]
+    """Set up Pixie Plus Local from a config entry."""
+    runtime_data = await _async_build_runtime_data(hass, entry)
+    desired_title = (
+        runtime_data.pixie_runtime.inventory.home_name
+        if runtime_data.pixie_runtime.inventory and runtime_data.pixie_runtime.inventory.home_name
+        else runtime_data.cloud_params.home_name
+    ) or INTEGRATION_TITLE
+    if entry.title != desired_title:
+        hass.config_entries.async_update_entry(entry, title=desired_title)
+    entry.runtime_data = runtime_data
+    await async_register_device_topology(hass, entry, runtime_data.pixie_runtime.inventory, domain=DOMAIN)
 
-        entry.async_on_unload(entry.add_update_listener(update_listener))
-
-        # Create or reuse the shared coordinator (tests patch AlarmAndReminderCoordinator)
-        coordinator = await _async_get_or_create_coordinator(hass)
-
-        coordinator.set_default_media_player(entry.options.get(CONF_MEDIA_PLAYER))
-        allowed_option = (
-            entry.options.get(CONF_ALLOWED_ACTIVATION_ENTITIES)
-            if CONF_ALLOWED_ACTIVATION_ENTITIES in entry.options
-            else None
-        )
-        coordinator.set_allowed_activation_entities(allowed_option)
-        coordinator.set_default_snooze_minutes(
-            entry.options.get(CONF_DEFAULT_SNOOZE_MINUTES)
-        )
-        coordinator.set_active_press_mode(
-            entry.options.get(CONF_ACTIVE_PRESS_MODE)
-        )
-        # Publish updated defaults/allow-list to the dashboard sensor immediately
-        coordinator._update_dashboard_state()
-
-        # Attach stable id and create device so switches group under one device
-        # Use a fixed shared device identifier so all entries use the same device
-        coordinator.id = DOMAIN  # stable identifier shared across entries
-        device_registry = dr.async_get(hass)
-        device_registry.async_get_or_create(
-            config_entry_id=entry.entry_id,  # Link device to the actual ConfigEntry
-            identifiers={(DOMAIN, coordinator.id)},
-            name=DEFAULT_NAME,
-            model="HA Alarm Clock",
-            sw_version="0.0.0",
-            manufacturer="@nirnachmani",
-        )
-
-
-        # Store coordinator and entities list for this entry
-        entry_store["coordinator"] = coordinator
-        entry_store.setdefault("entities", [])
-
-        # Let coordinator restore saved items if it supports it
-        if hasattr(coordinator, "async_load_items"):
-            await coordinator.async_load_items()
-
-        # --- Service handlers (ensure services.yaml remains for UI metadata) ---
-        def _extract_target(call: ServiceCall) -> tuple[str | None, bool | None]:
-            """Return (item_id, is_alarm) inferred from call data/target."""
-            raw_target: str | None = None
-            is_alarm: bool | None = None
-
-            _LOGGER.debug("Extract target raw call data=%s target=%s", call.data, getattr(call, "target", None))
-
-            entity_data = call.data.get("entity_id")
-            if entity_data:
-                raw_target = entity_data[0] if isinstance(entity_data, (list, tuple, set)) else entity_data
-
-            if "alarm_id" in call.data:
-                raw_target = call.data["alarm_id"]
-                is_alarm = True
-            elif "reminder_id" in call.data:
-                raw_target = call.data["reminder_id"]
-                is_alarm = False
-            else:
-                entity_ids = None
-                target_info = getattr(call, "target", None)
-                _LOGGER.debug("Extract target target_info=%s (%s)", target_info, type(target_info))
-                if target_info:
-                    if isinstance(target_info, dict):
-                        entity_ids = target_info.get("entity_id")
-                    else:
-                        entity_ids = getattr(target_info, "entity_id", None)
-                        if not entity_ids:
-                            entity_ids = getattr(target_info, "entity_ids", None)
-                if entity_ids:
-                    entity = entity_ids[0] if isinstance(entity_ids, (list, tuple, set)) else entity_ids
-                    raw_target = entity
-                    if isinstance(entity, str):
-                        if entity.startswith(f"{ALARM_ENTITY_DOMAIN}."):
-                            is_alarm = True
-                        elif entity.startswith(f"{REMINDER_ENTITY_DOMAIN}."):
-                            is_alarm = False
-
-            if isinstance(raw_target, str):
-                raw_target = coordinator._strip_domain(raw_target)
-
-            if raw_target and is_alarm is None:
-                item = coordinator._active_items.get(raw_target)
-                if item is not None:
-                    is_alarm = bool(item.get("is_alarm"))
-
-            return raw_target, is_alarm
-
-        async def _handle_set_alarm(call: ServiceCall) -> None:
-            target = _validate_target(call)
-            await coordinator.schedule_item(call, True, target)
-
-        async def _handle_set_reminder(call: ServiceCall) -> None:
-            target = _validate_target(call)
-            await coordinator.schedule_item(call, False, target)
-
-        async def _handle_stop(call: ServiceCall) -> None:
-            item_id, is_alarm = _extract_target(call)
-            _LOGGER.debug("Service stop resolved target: id=%s is_alarm=%s", item_id, is_alarm)
-            if item_id is not None and is_alarm is not None:
-                await coordinator.stop_item(item_id, is_alarm)
-
-        async def _handle_snooze(call: ServiceCall) -> None:
-            minutes = call.data.get("minutes")
-            item_id, is_alarm = _extract_target(call)
-            _LOGGER.debug("Service snooze resolved target: id=%s is_alarm=%s", item_id, is_alarm)
-            if item_id is not None and is_alarm is not None:
-                default_minutes = coordinator.get_default_snooze_minutes()
-                duration = minutes if minutes is not None else default_minutes
-                await coordinator.snooze_item(item_id, int(duration), is_alarm)
-
-        async def _handle_delete(call: ServiceCall) -> None:
-            item_id, is_alarm = _extract_target(call)
-            _LOGGER.debug("Service delete resolved target: id=%s is_alarm=%s", item_id, is_alarm)
-            if item_id is not None and is_alarm is not None:
-                await coordinator.delete_item(item_id, is_alarm)
-
-        # Register services under domain (these names match services.yaml)
-        hass.services.async_register(
-            DOMAIN, "set_alarm", _handle_set_alarm)
-        hass.services.async_register(
-            DOMAIN, "set_reminder", _handle_set_reminder)
-        hass.services.async_register(
-            DOMAIN, "stop", _handle_stop)
-        hass.services.async_register(
-            DOMAIN, "snooze", _handle_snooze)
-        hass.services.async_register(
-            DOMAIN, "delete", _handle_delete)
-        # ...register other services (reschedule, edit, stop_all, etc.) similarly...
-        # -----------------------------------------------------------------------
-
-        enable_llm = entry.options.get(CONF_ENABLE_LLM, DEFAULT_ENABLE_LLM)
-        if enable_llm:
-            try:
-                await async_setup_llm_api(hass)
-                _LOGGER.info("LLM API setup completed for HA Alarm Clock")
-            except Exception as llm_err:
-                _LOGGER.warning("Failed to setup LLM API (non-critical): %s", llm_err)
-
-        # Forward platforms and finish setup
+    if PLATFORMS:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-        return True
 
-    except Exception as err:
-        _LOGGER.error("Error setting up config entry: %s", err, exc_info=True)
-        return False
+    return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        try:
-            await async_cleanup_llm_api(hass)
-            _LOGGER.info("LLM API cleanup completed")
-        except Exception as llm_err:
-            _LOGGER.debug("Error cleaning up LLM API: %s", llm_err)        
-        hass.data[DOMAIN].pop(entry.entry_id)
-    return unload_ok
+    """Unload a Pixie Plus Local config entry."""
+    unload_ok = True
+    if PLATFORMS:
+        unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Update listener."""
-    await hass.config_entries.async_reload(entry.entry_id)
+    if not unload_ok:
+        return False
 
-async def async_stop_all_alarms(call: ServiceCall):
-    """Handle stop all alarms service call."""
-    try:
-        hass = call.hass
-        coordinator = None
-        _LOGGER.debug(
-            "Service handler async_stop_all_alarms (post-setup duplicate) invoked: data=%s",
-            call.data,
-        )
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.stop_all_items(is_alarm=True)
-    except Exception as err:
-        _LOGGER.error("Error stopping all alarms: %s", err)
-
-async def async_stop_all_reminders(call: ServiceCall):
-    """Handle stop all reminders service call."""
-    try:
-        hass = call.hass
-        coordinator = None
-        _LOGGER.debug(
-            "Service handler async_stop_all_reminders (post-setup duplicate) invoked: data=%s",
-            call.data,
-        )
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.stop_all_items(is_alarm=False)
-    except Exception as err:
-        _LOGGER.error("Error stopping all reminders: %s", err)
-
-async def async_stop_all(call: ServiceCall):
-    """Handle stop all service call."""
-    try:
-        hass = call.hass
-        coordinator = None
-        _LOGGER.debug(
-            "Service handler async_stop_all (post-setup duplicate) invoked: data=%s",
-            call.data,
-        )
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.stop_all_items()
-    except Exception as err:
-        _LOGGER.error("Error stopping all items: %s", err)
-
-async def async_delete_alarm(call: ServiceCall) -> None:
-    """Handle delete alarm service call."""
-    try:
-        hass = call.hass
-        alarm_id = call.data.get("alarm_id")
-        coordinator = None
-        
-        # Look for coordinator in hass.data instead of call.data
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.delete_item(alarm_id, is_alarm=True)
-        else:
-            _LOGGER.error("No coordinator found")
-            
-    except Exception as err:
-        _LOGGER.error("Error deleting alarm: %s", err, exc_info=True)
-
-async def async_delete_reminder(call: ServiceCall) -> None:
-    """Handle delete reminder service call."""
-    try:
-        hass = call.hass
-        reminder_id = call.data.get("reminder_id")
-        coordinator = None
-        
-        # Look for coordinator in hass.data instead of call.data
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.delete_item(reminder_id, is_alarm=False)
-        else:
-            _LOGGER.error("No coordinator found")
-            
-    except Exception as err:
-        _LOGGER.error("Error deleting reminder: %s", err, exc_info=True)
-
-async def async_delete_all_alarms(call: ServiceCall) -> None:
-    """Handle delete all alarms service call."""
-    try:
-        hass = call.hass
-        coordinator = None
-        # Look for coordinator in hass.data instead of call.data
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.delete_all_items(is_alarm=True)
-        else:
-            _LOGGER.error("No coordinator found")
-            
-    except Exception as err:
-        _LOGGER.error("Error deleting all alarms: %s", err, exc_info=True)
-
-async def async_delete_all_reminders(call: ServiceCall) -> None:
-    """Handle delete all reminders service call."""
-    try:
-        hass = call.hass
-        coordinator = None
-        # Look for coordinator in hass.data instead of call.data
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.delete_all_items(is_alarm=False)
-        else:
-            _LOGGER.error("No coordinator found")
-            
-    except Exception as err:
-        _LOGGER.error("Error deleting all reminders: %s", err, exc_info=True)
-
-async def async_delete_all(call: ServiceCall) -> None:
-    """Handle delete all service call."""
-    try:
-        hass = call.hass
-        coordinator = None
-        # Look for coordinator in hass.data instead of call.data
-        for entry_id, data in hass.data[DOMAIN].items():
-            if isinstance(data, dict) and "coordinator" in data:
-                coordinator = data["coordinator"]
-                break
-        
-        if coordinator:
-            await coordinator.delete_all_items()
-        else:
-            _LOGGER.error("No coordinator found")
-            
-    except Exception as err:
-        _LOGGER.error("Error deleting all items: %s", err, exc_info=True)
-
-
-async def _async_handle_resolve_media_ws(hass, connection, msg):
-    """Resolve additional media metadata for the companion cards."""
-    coordinator = await _async_get_or_create_coordinator(hass)
-    if coordinator is None:
-        connection.send_error(msg["id"], "not_ready", "Coordinator unavailable")
-        return
-
-    try:
-        result = await coordinator.async_resolve_media_metadata(
-            msg["media_content_id"],
-            msg.get("media_content_type"),
-            msg.get("provider"),
-        )
-    except HomeAssistantError as err:
-        connection.send_error(msg["id"], "resolve_failed", str(err))
-        return
-
-
-@websocket_api.websocket_command(
-    {
-        vol.Required("type"): f"{DOMAIN}/resolve_media",
-        vol.Required("media_content_id"): cv.string,
-        vol.Optional("media_content_type"): cv.string,
-        vol.Optional("provider"): cv.string,
-    }
-)
-@websocket_api.async_response
-async def websocket_resolve_media_metadata(hass, connection, msg):
-    """Resolve media metadata for HA Alarm Clock cards."""
-    await _async_handle_resolve_media_ws(hass, connection, msg)
-
-
-    connection.send_result(msg["id"], result)
+    runtime_data: PixiePlusConfigEntryRuntimeData = entry.runtime_data
+    await runtime_data.async_shutdown(hass)
+    return True

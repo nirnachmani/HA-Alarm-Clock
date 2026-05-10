@@ -47,6 +47,7 @@ from .storage import AlarmReminderStorage
 _LOGGER = logging.getLogger(__name__)
 
 _DLNA_HASH_ID_PATTERN = re.compile(r"^:[0-9a-f]{32}$", re.IGNORECASE)
+_MIN_ANNOUNCEMENT_INTERVAL_SECONDS = 30.0
 
 __all__ = ["AlarmAndReminderCoordinator"]
 
@@ -137,10 +138,22 @@ class _PlaybackSession:
                 if not target:
                     _LOGGER.debug("[%s] Breaking loop: no target found", self.item_id)
                     break
-                await self._run_cycle(current, target)
+                cycle_started_at = time.monotonic()
+                sound_started = await self._run_cycle(current, target)
                 if self.stop_event.is_set():
                     _LOGGER.debug("[%s] Breaking loop: stop_event was set during cycle", self.item_id)
                     break
+                if not sound_started:
+                    elapsed = time.monotonic() - cycle_started_at
+                    remaining = max(0.0, _MIN_ANNOUNCEMENT_INTERVAL_SECONDS - elapsed)
+                    if remaining > 0:
+                        _LOGGER.debug(
+                            "[%s] Sound never started; waiting %.2fs before next announcement",
+                            self.item_id,
+                            remaining,
+                        )
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(self.stop_event.wait(), timeout=remaining)
         finally:
             _LOGGER.debug("[%s] Playback loop finished. Cleaning up.", self.item_id)
             await self._cleanup()
@@ -157,7 +170,7 @@ class _PlaybackSession:
                 register_context=self._register_service_context,
             )
 
-    async def _run_cycle(self, item: Dict[str, Any], target: str) -> None:
+    async def _run_cycle(self, item: Dict[str, Any], target: str) -> bool:
         message = self.coordinator._build_announcement_text(item)
         sound_media = item.get("sound_media")
         fallback_sound = item.get("sound_file")
@@ -171,7 +184,7 @@ class _PlaybackSession:
             target,
             message,
         )
-        await self.coordinator.media_handler.play_on_media_player(
+        return await self.coordinator.media_handler.play_on_media_player(
             target,
             message,
             is_alarm,
@@ -597,6 +610,7 @@ class AlarmAndReminderCoordinator:
         self._reminder_counter = 0
         self.storage = AlarmReminderStorage(hass)
         self._default_media_player: str | None = None
+        self._hidden_media_players: set[str] = set()
         self._allowed_activation_entities: set[str] | None = None
         self._default_snooze_minutes: int = DEFAULT_SNOOZE_MINUTES
         self._active_press_mode: str = DEFAULT_ACTIVE_PRESS_MODE
@@ -653,6 +667,30 @@ class AlarmAndReminderCoordinator:
     def get_default_media_player(self) -> str | None:
         """Return the configured default media player, if any."""
         return self._default_media_player
+
+    def set_hidden_media_players(self, entities: Iterable[str] | None) -> None:
+        """Store the configured hidden media-player list."""
+        hidden: set[str] = set()
+        if entities is not None:
+            for entity in entities:
+                if not entity:
+                    continue
+                try:
+                    normalized = cv.entity_id(str(entity))
+                except vol.Invalid:
+                    _LOGGER.warning(
+                        "Ignoring invalid hidden media player '%s' in options.",
+                        entity,
+                    )
+                    continue
+                if self._default_media_player and normalized == self._default_media_player:
+                    continue
+                hidden.add(normalized)
+        self._hidden_media_players = hidden
+
+    def get_hidden_media_players(self) -> list[str]:
+        """Return the configured hidden media-player list."""
+        return sorted(self._hidden_media_players)
 
     def set_allowed_activation_entities(self, entities: Iterable[str] | None) -> None:
         """Store the configured activation entities allow list."""
@@ -2310,6 +2348,25 @@ class AlarmAndReminderCoordinator:
             if candidate not in self._active_items:
                 return candidate
             counter += 1
+
+    @staticmethod
+    def _looks_like_generated_name(value: str | None, prefix: str) -> bool:
+        """Return whether the stored name looks auto-generated."""
+        if not isinstance(value, str) or not value:
+            return False
+        return re.fullmatch(rf"{re.escape(prefix)}_\d+", value) is not None
+
+    def _duplicate_name_for_item(self, item: Dict[str, Any], *, is_alarm: bool) -> str:
+        """Allocate the duplicate item's stored name."""
+        prefix = "alarm" if is_alarm else "reminder"
+        existing_name = item.get("name")
+        if isinstance(existing_name, str) and existing_name.strip():
+            stripped_name = existing_name.strip()
+            if is_alarm and self._looks_like_generated_name(stripped_name, prefix):
+                return self._get_next_available_id(prefix)
+            copy_base = self._slugify_name(f"{stripped_name}-copy")
+            return self._unique_name_slug(copy_base, prefix)
+        return self._get_next_available_id(prefix)
 
     @staticmethod
     def _humanize_name(slug: str) -> str:
@@ -4222,6 +4279,72 @@ class AlarmAndReminderCoordinator:
             _LOGGER.error("Error editing item %s: %s", item_id, err, exc_info=True)
             raise HomeAssistantError("Failed to edit item") from err
 
+    async def duplicate_item(self, item_id: str, is_alarm: bool) -> str:
+        """Duplicate an existing alarm or reminder."""
+        raw_id = self._strip_domain(item_id)
+        resolved_id = self._resolve_active_item_id(raw_id)
+        candidate_id = resolved_id or raw_id
+
+        existing_item = self._active_items.get(candidate_id)
+        if existing_item is None:
+            stored = await self.storage.async_load()
+            if isinstance(stored, dict) and candidate_id in stored:
+                existing_item = self._normalize_item_fields(stored[candidate_id])
+                self._active_items[candidate_id] = existing_item
+
+        if existing_item is None:
+            raise HomeAssistantError(f"Item not found: {item_id}")
+
+        if existing_item.get("is_alarm") != is_alarm:
+            raise HomeAssistantError(
+                f"Cannot duplicate {'alarm' if not is_alarm else 'reminder'} with the {'alarm' if is_alarm else 'reminder'} service"
+            )
+
+        duplicated_id = self._duplicate_name_for_item(existing_item, is_alarm=is_alarm)
+        duplicated = dict(existing_item)
+        duplicated["name"] = duplicated_id
+        duplicated["entity_id"] = duplicated_id
+        duplicated["unique_id"] = duplicated_id
+        duplicated.pop("id", None)
+
+        scheduled_time = duplicated.get("scheduled_time")
+        if isinstance(scheduled_time, str):
+            parsed_scheduled_time = dt_util.parse_datetime(scheduled_time)
+            if parsed_scheduled_time is not None:
+                scheduled_time = parsed_scheduled_time
+                duplicated["scheduled_time"] = parsed_scheduled_time
+
+        scheduled_time_canonical = duplicated.get("scheduled_time_canonical")
+        if isinstance(scheduled_time_canonical, str):
+            parsed_canonical = dt_util.parse_datetime(scheduled_time_canonical)
+            if parsed_canonical is not None:
+                duplicated["scheduled_time_canonical"] = parsed_canonical
+
+        normalized = self._normalize_item_fields(duplicated)
+        enabled = bool(normalized.get("enabled", True))
+
+        if enabled:
+            if isinstance(scheduled_time, datetime) and scheduled_time >= dt_util.now():
+                normalized["status"] = "scheduled"
+            else:
+                normalized["status"] = "expired"
+        else:
+            normalized["status"] = "disabled"
+
+        self._active_items[duplicated_id] = normalized
+        await self.storage.async_save(self._active_items)
+
+        self._cancel_scheduled_trigger(duplicated_id)
+        if enabled and isinstance(normalized.get("scheduled_time"), datetime) and normalized["status"] == "scheduled":
+            self._schedule_trigger(duplicated_id, normalized.get("scheduled_time"))
+            if is_alarm:
+                self._bump_last_alarm_time(normalized.get("scheduled_time"))
+
+        self._write_item_state(duplicated_id)
+        self._update_dashboard_state()
+        self._broadcast_state_refresh(action="duplicated")
+        return duplicated_id
+
     async def delete_item(self, item_id: str, is_alarm: bool) -> None:
         """Delete a specific item."""
         try:
@@ -4570,6 +4693,7 @@ class AlarmAndReminderCoordinator:
                 "default_reminder_sound": DEFAULT_REMINDER_SOUND,
                 "default_snooze_minutes": self.get_default_snooze_minutes(),
                 "active_press_mode": self.get_active_press_mode(),
+                "hidden_media_players": self.get_hidden_media_players(),
                 "allowed_activation_entities": sorted(self._allowed_activation_entities)
                 if self._allowed_activation_entities
                 else [],

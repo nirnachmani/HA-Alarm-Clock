@@ -368,10 +368,11 @@ class MediaHandler:
         *,
         item_id: str | None = None,
         volume: float | None = None,
-    ) -> None:
-        """Play TTS and sound on media player."""
+    ) -> bool:
+        """Play TTS and sound on media player and return whether sound playback started."""
         playback_monitor: _PlaybackWatcher | None = None
         media_monitor: _PlaybackWatcher | None = None
+        sound_started = False
         try:
             if 'player_profile' not in locals():
                 player_profile = self._get_media_player_profile(media_player)
@@ -477,7 +478,7 @@ class MediaHandler:
                 )
 
             if attempted_tts and stop_event and stop_event.is_set():
-                return
+                return sound_started
 
             playback_started = False
             playback_latency: float | None = None
@@ -498,7 +499,7 @@ class MediaHandler:
                         monitor_state = state.state
                         monitor_attrs = dict(state.attributes or {})
                 if stop_event and stop_event.is_set():
-                    return
+                    return sound_started
             else:
                 _LOGGER.debug(
                     "MediaHandler: no TTS dispatched on %s; proceeding directly to sound",
@@ -517,7 +518,7 @@ class MediaHandler:
                     )
                 for _ in range(160):
                     if stop_event and stop_event.is_set():
-                        return
+                        return sound_started
                     state = self.hass.states.get(media_player)
                     if not state or state.state not in ("playing", "buffering"):
                         break
@@ -540,7 +541,7 @@ class MediaHandler:
                         "MediaHandler: spotify_source missing for player %s; cannot start playback.",
                         media_player,
                     )
-                    return
+                    return sound_started
                 try:
                     await self._ensure_spotify_source_selected(
                         media_player,
@@ -556,7 +557,7 @@ class MediaHandler:
                             register_context,
                         )
                 except Exception:
-                    return
+                    return sound_started
 
             media_source, media_type = self._resolve_media(
                 sound_media,
@@ -596,13 +597,12 @@ class MediaHandler:
             )
 
             if stop_event:
-                sound_started = False
                 sound_latency: float | None = None
                 sound_state: str | None = None
                 sound_attrs: Dict[str, Any] | None = None
                 if media_monitor:
                     wait_started = perf_counter()
-                    sound_started = await media_monitor.wait_started(timeout=4.0)
+                    sound_started = await media_monitor.wait_started(timeout=10.0)
                     sound_latency = perf_counter() - wait_started
                     sound_state = media_monitor.last_state
                     sound_attrs = (
@@ -613,6 +613,13 @@ class MediaHandler:
                 else:
                     state = self.hass.states.get(media_player)
                     if state:
+                        sound_state = state.state
+                        sound_attrs = dict(state.attributes or {})
+
+                if not sound_started:
+                    state = self.hass.states.get(media_player)
+                    if state and state.state in ("playing", "buffering"):
+                        sound_started = True
                         sound_state = state.state
                         sound_attrs = dict(state.attributes or {})
 
@@ -632,7 +639,7 @@ class MediaHandler:
                         await asyncio.sleep(0.5)
                 else:
                     _LOGGER.debug(
-                        "MediaHandler: sound on %s never entered playing state after play_media (last_state=%s, attrs=%s)",
+                        "MediaHandler: sound on %s never entered playing/buffering within 10s after play_media (last_state=%s, attrs=%s)",
                         media_player,
                         sound_state or "<unknown>",
                         sound_attrs or {},
@@ -645,6 +652,8 @@ class MediaHandler:
                 playback_monitor.close()
             if media_monitor:
                 media_monitor.close()
+        return sound_started
+
     def _ensure_tts_entity(self) -> str | None:
         """Find or cache a TTS entity to use for announcements."""
         if self._tts_entity and self.hass.states.get(self._tts_entity):

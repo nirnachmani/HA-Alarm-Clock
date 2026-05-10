@@ -12,6 +12,7 @@ from homeassistant.util.json import JsonObjectType
 from homeassistant.util import dt as dt_util
 
 from .const import DASHBOARD_ENTITY_ID, DOMAIN
+from .llm_media_player import resolve_room_media_player_candidates
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -162,7 +163,7 @@ class SetReminderTool(llm.Tool):
     )
 
     def wrap_response(self, response: dict) -> dict:
-        response["instruction"] = self.response_instruction
+        response.setdefault("instruction", self.response_instruction)
         return response
 
     def _validate_time(self, time_str: str) -> tuple[bool, str]:
@@ -242,6 +243,17 @@ class SetReminderTool(llm.Tool):
             if not coordinator:
                 return {"error": "Reminder system coordinator not found"}
 
+            auto_selected_media_player_name: str | None = None
+            if not media_player:
+                area_resolution = resolve_room_media_player_candidates(
+                    hass,
+                    conversation_device_id=getattr(tool_input, "device_id", None),
+                )
+                selected_player = area_resolution.get("selected")
+                if selected_player:
+                    media_player = selected_player["entity_id"]
+                    auto_selected_media_player_name = selected_player["name"]
+
             # Create service call data
             service_data: dict[str, Any] = {
                 "time": time_obj,
@@ -298,6 +310,8 @@ class SetReminderTool(llm.Tool):
             response_msg = f"Reminder '{name}' set for {time_str}"
             if repeat_days:
                 response_msg += f" on {', '.join(repeat_days)}"
+            if auto_selected_media_player_name:
+                response_msg += f" using {auto_selected_media_player_name}"
 
             return self.wrap_response({
                 "success": True,

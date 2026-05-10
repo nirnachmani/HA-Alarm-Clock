@@ -569,6 +569,30 @@ delete_reminder:
         entity:
           domain: ha_alarm_clock_reminder
 
+duplicate_alarm:
+  name: Duplicate Alarm
+  description: Duplicate an existing alarm with all user-configurable settings.
+  fields:
+    alarm_id:
+      name: Alarm
+      description: Select the alarm to duplicate
+      required: true
+      selector:
+        entity:
+          domain: ha_alarm_clock_alarm
+
+duplicate_reminder:
+  name: Duplicate Reminder
+  description: Duplicate an existing reminder with all user-configurable settings.
+  fields:
+    reminder_id:
+      name: Reminder
+      description: Select the reminder to duplicate
+      required: true
+      selector:
+        entity:
+          domain: ha_alarm_clock_reminder
+
 delete_all_alarms:
   name: Delete All Alarms
   description: Delete all alarms

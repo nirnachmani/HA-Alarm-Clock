@@ -13,6 +13,7 @@ from .const import (
     CONF_ALARM_SOUND,
     CONF_REMINDER_SOUND,
     CONF_MEDIA_PLAYER,
+    CONF_HIDDEN_MEDIA_PLAYERS,
     CONF_ALLOWED_ACTIVATION_ENTITIES,
     CONF_ENABLE_LLM,
     CONF_DEFAULT_SNOOZE_MINUTES,
@@ -22,6 +23,7 @@ from .const import (
     DEFAULT_ALARM_SOUND,
     DEFAULT_REMINDER_SOUND,
     DEFAULT_MEDIA_PLAYER,
+    DEFAULT_HIDDEN_MEDIA_PLAYERS,
     DEFAULT_NAME,
     DEFAULT_ENABLE_LLM,
     DEFAULT_ALLOWED_ACTIVATION_ENTITIES,
@@ -53,16 +55,48 @@ class HAAlarmClockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return OptionsFlowHandler()
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
+    def _media_player_entity_ids(self) -> list[str]:
+        """Return currently available media players."""
+        return sorted(self.hass.states.async_entity_ids("media_player"))
+
+    def _normalize_hidden_media_players(
+        self,
+        value: Any,
+        *,
+        available_media_players: set[str],
+        default_media_player: str | None,
+    ) -> list[str]:
+        """Normalize hidden media player options."""
+        if value in (None, ""):
+            return []
+
+        hidden: set[str] = set()
+        for entity in cv.ensure_list(value):
+            if not entity:
+                continue
+            normalized = cv.entity_id(str(entity))
+            if default_media_player and normalized == default_media_player:
+                raise vol.Invalid("default_media_player_hidden")
+            if normalized in available_media_players:
+                hidden.add(normalized)
+        return sorted(hidden)
+
     async def async_step_init(self, user_input=None):
         """Manage the options."""
         # Get list of media players plus "none" option
         media_players = ["none"]
-        media_player_entities = self.hass.states.async_entity_ids("media_player")
+        media_player_entities = self._media_player_entity_ids()
+        media_player_entity_set = set(media_player_entities)
         media_players.extend(media_player_entities)
         media_player_choices = list(media_players)
         if "" not in media_player_choices:
             media_player_choices.append("")
         media_player_choices_with_none = media_player_choices + [None]
+        configured_default_player = self.config_entry.options.get(
+            CONF_MEDIA_PLAYER,
+            DEFAULT_MEDIA_PLAYER,
+        )
+        excluded_hidden_candidates = [configured_default_player] if configured_default_player else []
 
         stored_allowed = self.config_entry.options.get(
             CONF_ALLOWED_ACTIVATION_ENTITIES,
@@ -74,6 +108,18 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             default_allowed_entities = [str(entity) for entity in stored_allowed if entity]
         else:
             default_allowed_entities = [str(stored_allowed)]
+
+        try:
+            default_hidden_media_players = self._normalize_hidden_media_players(
+                self.config_entry.options.get(
+                    CONF_HIDDEN_MEDIA_PLAYERS,
+                    DEFAULT_HIDDEN_MEDIA_PLAYERS,
+                ),
+                available_media_players=media_player_entity_set,
+                default_media_player=configured_default_player,
+            )
+        except vol.Invalid:
+            default_hidden_media_players = []
 
         data_schema = vol.Schema({
             vol.Optional(
@@ -92,6 +138,18 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_MEDIA_PLAYER,
                 default=self.config_entry.options.get(CONF_MEDIA_PLAYER, "none")
             ): vol.In(media_player_choices_with_none),
+            vol.Optional(
+                CONF_HIDDEN_MEDIA_PLAYERS,
+                default=default_hidden_media_players,
+            ): selector.selector(
+                {
+                    "entity": {
+                        "multiple": True,
+                        "filter": [{"domain": "media_player"}],
+                        "exclude_entities": excluded_hidden_candidates,
+                    }
+                }
+            ),
             vol.Optional(
                 CONF_ALLOWED_ACTIVATION_ENTITIES,
                 default=default_allowed_entities,
@@ -128,6 +186,15 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             selected_player = data.get(CONF_MEDIA_PLAYER)
             if not selected_player or selected_player == "none":
                 data[CONF_MEDIA_PLAYER] = None
+
+            try:
+                data[CONF_HIDDEN_MEDIA_PLAYERS] = self._normalize_hidden_media_players(
+                    data.get(CONF_HIDDEN_MEDIA_PLAYERS),
+                    available_media_players=media_player_entity_set,
+                    default_media_player=data.get(CONF_MEDIA_PLAYER),
+                )
+            except vol.Invalid:
+                errors[CONF_HIDDEN_MEDIA_PLAYERS] = "default_media_player_hidden"
 
             allowed_entities_input = data.get(CONF_ALLOWED_ACTIVATION_ENTITIES)
             if allowed_entities_input is None:

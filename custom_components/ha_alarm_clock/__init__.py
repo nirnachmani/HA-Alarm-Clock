@@ -29,6 +29,8 @@ from .const import (
     SERVICE_STOP_ALL,  
     SERVICE_EDIT_ALARM,  
     SERVICE_EDIT_REMINDER,
+    SERVICE_DUPLICATE_ALARM,
+    SERVICE_DUPLICATE_REMINDER,
     SERVICE_DELETE_ALARM, 
     SERVICE_DELETE_REMINDER,  
     SERVICE_DELETE_ALL_ALARMS,  
@@ -48,11 +50,13 @@ from .const import (
     DEFAULT_SNOOZE_MINUTES,
     DEFAULT_NAME,
     CONF_MEDIA_PLAYER,
+    CONF_HIDDEN_MEDIA_PLAYERS,
     CONF_ALLOWED_ACTIVATION_ENTITIES,
     CONF_ENABLE_LLM,
     CONF_ACTIVE_PRESS_MODE,
     CONF_DEFAULT_SNOOZE_MINUTES,
     DEFAULT_ENABLE_LLM,
+    DEFAULT_HIDDEN_MEDIA_PLAYERS,
     ALARM_ENTITY_DOMAIN,
     REMINDER_ENTITY_DOMAIN,
 )
@@ -87,6 +91,39 @@ SOUND_MEDIA_SCHEMA = vol.Schema(
 )
 
 SOUND_INPUT_SCHEMA = vol.Any(SOUND_MEDIA_SCHEMA, cv.string)
+
+
+def _normalize_option_entity_list(raw_value) -> list[str]:
+    """Normalize an arbitrary options value into a flat entity-id list."""
+    if raw_value in (None, ""):
+        return []
+
+    normalized: list[str] = []
+    for entity in cv.ensure_list(raw_value):
+        if not entity:
+            continue
+        try:
+            normalized.append(cv.entity_id(str(entity)))
+        except vol.Invalid:
+            continue
+    return sorted(set(normalized))
+
+
+def _normalize_hidden_media_players_option(
+    hass: HomeAssistant,
+    raw_value,
+    *,
+    default_media_player: str | None,
+) -> list[str]:
+    """Normalize the hidden-media-player option against current state."""
+    available_media_players = set(hass.states.async_entity_ids("media_player"))
+    hidden_media_players: list[str] = []
+    for entity_id in _normalize_option_entity_list(raw_value):
+        if entity_id == default_media_player:
+            continue
+        if entity_id in available_media_players:
+            hidden_media_players.append(entity_id)
+    return hidden_media_players
 
 
 def _resolve_media_player_from_call(call: ServiceCall) -> str | None:
@@ -510,6 +547,32 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 _LOGGER.error("Error editing reminder: %s", err, exc_info=True)
                 raise HomeAssistantError("Failed to edit reminder") from err
 
+        async def async_duplicate_alarm(call: ServiceCall):
+            """Handle duplicate alarm service call."""
+            try:
+                coordinator = await _get_coordinator(hass)
+                if coordinator:
+                    await coordinator.duplicate_item(call.data["alarm_id"], is_alarm=True)
+            except HomeAssistantError as err:
+                _LOGGER.error("Error duplicating alarm: %s", err)
+                raise
+            except Exception as err:
+                _LOGGER.error("Error duplicating alarm: %s", err, exc_info=True)
+                raise HomeAssistantError("Failed to duplicate alarm") from err
+
+        async def async_duplicate_reminder(call: ServiceCall):
+            """Handle duplicate reminder service call."""
+            try:
+                coordinator = await _get_coordinator(hass)
+                if coordinator:
+                    await coordinator.duplicate_item(call.data["reminder_id"], is_alarm=False)
+            except HomeAssistantError as err:
+                _LOGGER.error("Error duplicating reminder: %s", err)
+                raise
+            except Exception as err:
+                _LOGGER.error("Error duplicating reminder: %s", err, exc_info=True)
+                raise HomeAssistantError("Failed to duplicate reminder") from err
+
         # Register edit services
         hass.services.async_register(
             DOMAIN,
@@ -550,6 +613,24 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 vol.Optional("repeat_days"): _validate_repeat_days,
                 vol.Optional(ATTR_VOLUME): _validate_volume,
             }, extra=vol.ALLOW_EXTRA),
+        )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DUPLICATE_ALARM,
+            async_duplicate_alarm,
+            schema=vol.Schema({
+                vol.Required("alarm_id"): ALARM_ID_VALIDATOR,
+            }),
+        )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DUPLICATE_REMINDER,
+            async_duplicate_reminder,
+            schema=vol.Schema({
+                vol.Required("reminder_id"): REMINDER_ID_VALIDATOR,
+            }),
         )
 
         # Set up intents
@@ -759,12 +840,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].setdefault(entry.entry_id, {})
         entry_store = hass.data[DOMAIN][entry.entry_id]
 
+        default_media_player = entry.options.get(CONF_MEDIA_PLAYER)
+        stored_hidden_media_players = _normalize_option_entity_list(
+            entry.options.get(
+                CONF_HIDDEN_MEDIA_PLAYERS,
+                DEFAULT_HIDDEN_MEDIA_PLAYERS,
+            )
+        )
+        cleaned_hidden_media_players = _normalize_hidden_media_players_option(
+            hass,
+            entry.options.get(
+                CONF_HIDDEN_MEDIA_PLAYERS,
+                DEFAULT_HIDDEN_MEDIA_PLAYERS,
+            ),
+            default_media_player=default_media_player,
+        )
+        if stored_hidden_media_players != cleaned_hidden_media_players:
+            updated_options = dict(entry.options)
+            updated_options[CONF_HIDDEN_MEDIA_PLAYERS] = cleaned_hidden_media_players
+            hass.config_entries.async_update_entry(entry, options=updated_options)
+
         entry.async_on_unload(entry.add_update_listener(update_listener))
 
         # Create or reuse the shared coordinator (tests patch AlarmAndReminderCoordinator)
         coordinator = await _async_get_or_create_coordinator(hass)
 
-        coordinator.set_default_media_player(entry.options.get(CONF_MEDIA_PLAYER))
+        coordinator.set_default_media_player(default_media_player)
+        coordinator.set_hidden_media_players(cleaned_hidden_media_players)
         allowed_option = (
             entry.options.get(CONF_ALLOWED_ACTIVATION_ENTITIES)
             if CONF_ALLOWED_ACTIVATION_ENTITIES in entry.options

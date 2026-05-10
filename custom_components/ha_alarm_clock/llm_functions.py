@@ -40,6 +40,8 @@ For Reminders:
 - When a user asks to stop or dismiss a ringing reminder, use the stop_reminder tool
 - When a user asks to snooze a ringing reminder, use the snooze_reminder tool
 
+If a tool response says clarification is needed, ask the user a brief follow-up question and wait for the answer instead of guessing.
+
 Be helpful and conversational when confirming actions or listing items.
 """.strip()
 

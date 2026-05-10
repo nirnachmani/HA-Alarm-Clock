@@ -1,0 +1,35 @@
+{
+  "config": {
+    "abort": {
+      "single_instance_allowed": "Only one HA Alarm Clock configuration is allowed."
+    },
+    "step": {
+      "user": {
+        "title": "Set up HA Alarm Clock"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Alarm clock options",
+        "data": {
+          "alarm_sound": "Default alarm sound",
+          "reminder_sound": "Default reminder sound",
+          "media_player": "Default media player",
+          "hidden_media_players": "Hidden media players",
+          "allowed_activation_entities": "Allowed activation entities",
+          "enable_llm": "Enable LLM features",
+          "default_snooze_minutes": "Default snooze minutes",
+          "active_press_mode": "Active button press mode"
+        },
+        "data_description": {
+          "hidden_media_players": "Hide selected players from the alarm and reminder card pickers. Service calls and manual entity entry are unaffected."
+        }
+      }
+    },
+    "error": {
+      "default_media_player_hidden": "The default media player cannot also be hidden."
+    }
+  }
+}

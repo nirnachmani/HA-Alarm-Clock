@@ -63,6 +63,11 @@ DEFAULT_ACTIVE_PRESS_MODE = ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE
 DEFAULT_NOTIFICATION_TITLE = "HA Alarm Clock"
 DEFAULT_ENABLE_LLM = False
 
+# An item still marked "active" in storage on startup only resumes ringing if
+# its scheduled time is within this many minutes of now; older ones are stale
+# (e.g. HA was down for hours/days) and get rescheduled or expired instead.
+ACTIVE_RESUME_GRACE_MINUTES = 15
+
 SPOTIFY_PLATFORMS = {
 	"spotify",
 	"spotifyplus",

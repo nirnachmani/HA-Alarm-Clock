@@ -34,6 +34,7 @@ from .const import (
     DEFAULT_ACTIVE_PRESS_MODE,
     ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE,
     ACTIVE_PRESS_MODE_SHORT_SNOOZE_LONG_STOP,
+    ACTIVE_RESUME_GRACE_MINUTES,
     ALARM_ENTITY_DOMAIN,
     REMINDER_ENTITY_DOMAIN,
     DASHBOARD_ENTITY_ID,
@@ -2991,6 +2992,71 @@ class AlarmAndReminderCoordinator:
             msg += f": {reason}"
         _LOGGER.info(msg)
 
+    async def _discard_stale_active_item(
+        self,
+        item_id: str,
+        item: Dict[str, Any],
+        now: datetime,
+    ) -> Dict[str, Any]:
+        """Handle an item restored as "active" whose trigger time is long past.
+
+        Instead of resuming playback (possibly days after the alarm fired),
+        reschedule repeating items for their next occurrence and expire
+        one-off items, mirroring what stop_item does after playback.
+        """
+        repeat_value = (item.get("repeat", "once") or "once").lower()
+        canonical_time = item.get("scheduled_time_canonical")
+        if isinstance(canonical_time, str):
+            canonical_time = dt_util.parse_datetime(canonical_time)
+        if not isinstance(canonical_time, datetime):
+            sched = item.get("scheduled_time")
+            if isinstance(sched, str):
+                sched = dt_util.parse_datetime(sched)
+            canonical_time = sched if isinstance(sched, datetime) else None
+
+        item["status"] = "stopped"
+        item["last_stopped"] = now.isoformat()
+
+        next_time = None
+        if (
+            repeat_value != "once"
+            and item.get("enabled", True)
+            and isinstance(canonical_time, datetime)
+        ):
+            next_time = self._ensure_future_schedule_time(
+                canonical_time,
+                repeat=repeat_value,
+                repeat_days=item.get("repeat_days", []) or [],
+                reference=now,
+                force_advance=True,
+            )
+
+        if next_time is not None:
+            item["scheduled_time"] = next_time
+            item["scheduled_time_canonical"] = next_time
+            item["status"] = "scheduled"
+            item = self._normalize_item_fields(item)
+            self._active_items[item_id] = item
+            await self.storage.async_save(self._active_items)
+            self._schedule_trigger(item_id, next_time)
+            if item.get("is_alarm"):
+                self._bump_last_alarm_time(next_time)
+            _LOGGER.info(
+                "Discarded stale active item %s from a previous run; rescheduled for %s",
+                item_id,
+                next_time.isoformat(),
+            )
+        else:
+            item = self._normalize_item_fields(item)
+            self._active_items[item_id] = item
+            await self._mark_item_expired(
+                item_id,
+                reason="Item was still active from a previous run and its time has long passed",
+            )
+            item = self._active_items.get(item_id, item)
+
+        return item
+
     def _bump_last_alarm_time(self, scheduled_time: Optional[datetime]) -> None:
         """Track most recent alarm scheduling for default picker."""
         if scheduled_time and (
@@ -3175,9 +3241,21 @@ class AlarmAndReminderCoordinator:
                 # and include full items lists as attributes.
                 # schedule playback/resume as before per item
                 if status == "active":
-                    self._stop_events[item_id] = asyncio.Event()
-                    task = self.hass.async_create_task(self._start_playback(item_id), name=f"playback_{item_id}")
-                    self._playback_tasks[item_id] = task
+                    sched = item.get("scheduled_time")
+                    if isinstance(sched, str):
+                        sched = dt_util.parse_datetime(sched)
+                    resume_deadline = None
+                    if isinstance(sched, datetime):
+                        resume_deadline = dt_util.as_local(sched) + timedelta(
+                            minutes=ACTIVE_RESUME_GRACE_MINUTES
+                        )
+                    if resume_deadline is not None and now <= resume_deadline:
+                        self._stop_events[item_id] = asyncio.Event()
+                        task = self.hass.async_create_task(self._start_playback(item_id), name=f"playback_{item_id}")
+                        self._playback_tasks[item_id] = task
+                    else:
+                        item = await self._discard_stale_active_item(item_id, item, now)
+                        self._active_items[item_id] = item
                 # Schedule future triggers for scheduled items
                 elif status == "scheduled" and item.get("scheduled_time"):
                     sched = item["scheduled_time"]

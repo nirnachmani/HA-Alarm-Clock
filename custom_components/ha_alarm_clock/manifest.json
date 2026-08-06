@@ -13,7 +13,7 @@
   "integration_type": "service",
   "homeassistant": "2025.5.3",
   "requirements": [
-    "mutagen==1.47.0"
+    "mutagen>=1.47.0"
   ],
   "loggers": [
     "custom_components.ha_alarm_clock"

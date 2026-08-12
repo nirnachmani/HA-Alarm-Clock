@@ -40,6 +40,8 @@ from .const import (
     DASHBOARD_ENTITY_ID,
     ATTR_SPOTIFY_SOURCE,
     ATTR_VOLUME,
+    ATTR_USER_ID,
+    ATTR_USER_NAME,
     SPOTIFY_PLATFORMS,
 )
 
@@ -2616,6 +2618,33 @@ class AlarmAndReminderCoordinator:
             return min(1.0, number / 100.0)
         return 1.0
 
+    async def _resolve_owner_metadata(
+        self,
+        explicit_user_id: Any = None,
+        *,
+        context: Context | None = None,
+        use_context_default: bool = False,
+    ) -> Dict[str, str | None]:
+        """Resolve persisted owner metadata from an explicit field or HA context."""
+        if explicit_user_id in ("", None):
+            if not use_context_default:
+                return {ATTR_USER_ID: None, ATTR_USER_NAME: None}
+            user_id = getattr(context, "user_id", None) if context else None
+        else:
+            user_id = str(explicit_user_id).strip()
+
+        if not user_id:
+            return {ATTR_USER_ID: None, ATTR_USER_NAME: None}
+
+        user = await self.hass.auth.async_get_user(user_id)
+        if user is None:
+            raise ValueError(f"Unknown Home Assistant user: {user_id}")
+
+        return {
+            ATTR_USER_ID: user.id,
+            ATTR_USER_NAME: user.name or user.id,
+        }
+
     def _normalize_item_fields(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize internal representation of an alarm/reminder item."""
         normalized = dict(item)
@@ -2697,6 +2726,15 @@ class AlarmAndReminderCoordinator:
             repeat_value = "custom"
 
         normalized["repeat"] = repeat_value
+
+        user_id = normalized.get(ATTR_USER_ID)
+        if user_id in ("", None):
+            normalized[ATTR_USER_ID] = None
+            normalized[ATTR_USER_NAME] = None
+        else:
+            normalized[ATTR_USER_ID] = str(user_id)
+            user_name = normalized.get(ATTR_USER_NAME)
+            normalized[ATTR_USER_NAME] = str(user_name) if user_name not in ("", None) else None
 
         raw_name = normalized.get("name")
         if isinstance(raw_name, str):
@@ -3431,6 +3469,14 @@ class AlarmAndReminderCoordinator:
                 item_name=item_id,
             )
             volume_override = self._normalize_volume_override(call.data.get(ATTR_VOLUME))
+            if ATTR_USER_ID in call.data:
+                owner_metadata = await self._resolve_owner_metadata(call.data.get(ATTR_USER_ID))
+            else:
+                owner_metadata = await self._resolve_owner_metadata(
+                    None,
+                    context=getattr(call, "context", None),
+                    use_context_default=True,
+                )
 
             item = {
                 "scheduled_time": scheduled_time,
@@ -3451,6 +3497,7 @@ class AlarmAndReminderCoordinator:
                 "announce_time": bool(call.data.get("announce_time", True)),
                 "announce_name": bool(call.data.get("announce_name", True)) if is_alarm else True,
                 "activation_entity": activation_entity,
+                **owner_metadata,
             }
 
             if spotify_source_value:
@@ -4227,6 +4274,11 @@ class AlarmAndReminderCoordinator:
                 else:
                     item.pop(ATTR_VOLUME, None)
 
+            if ATTR_USER_ID in changes:
+                owner_metadata = await self._resolve_owner_metadata(changes.pop(ATTR_USER_ID))
+                item.update(owner_metadata)
+                changes.pop(ATTR_USER_NAME, None)
+
             incoming_name = changes.get("name", None)
             if incoming_name is not None:
                 slug = self._slugify_name(incoming_name)
@@ -4752,6 +4804,8 @@ class AlarmAndReminderCoordinator:
                     "notify_device": serialized.get("notify_device"),
                     "announce_time": serialized.get("announce_time", True),
                     "activation_entity": serialized.get("activation_entity"),
+                    ATTR_USER_ID: serialized.get(ATTR_USER_ID),
+                    ATTR_USER_NAME: serialized.get(ATTR_USER_NAME),
                 }
                 if item.get("status") == "active":
                     overall_state = "active"

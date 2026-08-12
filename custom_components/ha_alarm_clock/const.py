@@ -36,6 +36,8 @@ ATTR_NOTIFY_DEVICE = "notify_device"
 ATTR_NOTIFY_TITLE = "HA Alarm Clock"
 ATTR_SPOTIFY_SOURCE = "spotify_source"
 ATTR_VOLUME = "volume"
+ATTR_USER_ID = "user_id"
+ATTR_USER_NAME = "user_name"
 
 # Configuration
 CONF_ALARM_SOUND = "alarm_sound"

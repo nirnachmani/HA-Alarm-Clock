@@ -16,6 +16,8 @@ from .const import (
     DEFAULT_NAME,
     ALARM_ENTITY_DOMAIN,
     REMINDER_ENTITY_DOMAIN,
+    ATTR_USER_ID,
+    ATTR_USER_NAME,
 )
 from .coordinator import AlarmAndReminderCoordinator
 
@@ -139,6 +141,8 @@ class AlarmItemSwitch(SwitchEntity):
             "sound_media": item.get("sound_media"),
             "notify_device": item.get("notify_device"),
             "enabled": item.get("enabled", True),
+            ATTR_USER_ID: item.get(ATTR_USER_ID),
+            ATTR_USER_NAME: item.get(ATTR_USER_NAME),
         }
 
     @property

@@ -104,6 +104,13 @@ set_alarm:
       required: false
       selector:
         entity: {}
+    user_id:
+      name: Owner User ID
+      description: Optional Home Assistant user ID to assign as owner. Leave empty for no owner; omit to use the caller.
+      required: false
+      selector:
+        text:
+          multiline: false
     volume:
       name: Volume
       description: Optional playback volume (0-100%). Leave blank to keep the current volume.
@@ -206,6 +213,13 @@ set_reminder:
       required: false
       selector:
         entity: {}
+    user_id:
+      name: Owner User ID
+      description: Optional Home Assistant user ID to assign as owner. Leave empty for no owner; omit to use the caller.
+      required: false
+      selector:
+        text:
+          multiline: false
     volume:
       name: Volume
       description: Optional playback volume (0-100%). Leave blank to keep the current volume.
@@ -430,6 +444,13 @@ edit_alarm:
       required: false
       selector:
         entity: {}
+    user_id:
+      name: Owner User ID
+      description: Optional Home Assistant user ID to assign as owner. Leave empty for no owner.
+      required: false
+      selector:
+        text:
+          multiline: false
     volume:
       name: Volume
       description: Optional playback volume (0-100%). Leave blank to keep the current volume.
@@ -534,6 +555,13 @@ edit_reminder:
       required: false
       selector:
         entity: {}
+    user_id:
+      name: Owner User ID
+      description: Optional Home Assistant user ID to assign as owner. Leave empty for no owner.
+      required: false
+      selector:
+        text:
+          multiline: false
     volume:
       name: Volume
       description: Optional playback volume (0-100%). Leave blank to keep the current volume.

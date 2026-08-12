@@ -47,6 +47,7 @@ from .const import (
     ATTR_NOTIFY_TITLE,      
     ATTR_SPOTIFY_SOURCE,
     ATTR_VOLUME,
+    ATTR_USER_ID,
     DEFAULT_SNOOZE_MINUTES,
     DEFAULT_NAME,
     CONF_MEDIA_PLAYER,
@@ -411,6 +412,14 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             vol.Optional(ATTR_VOLUME): _validate_volume,
         })
 
+        OWNER_FIELD_SCHEMA = vol.Any(cv.string, None)
+        ALARM_SERVICE_SCHEMA = ALARM_SERVICE_SCHEMA.extend({
+            vol.Optional(ATTR_USER_ID): OWNER_FIELD_SCHEMA,
+        })
+        REMINDER_SERVICE_SCHEMA = REMINDER_SERVICE_SCHEMA.extend({
+            vol.Optional(ATTR_USER_ID): OWNER_FIELD_SCHEMA,
+        })
+
         # Store coordinator for future access
         hass.data[DOMAIN]["coordinator"] = coordinator
 
@@ -440,6 +449,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         )
 
         websocket_api.async_register_command(hass, websocket_resolve_media_metadata)
+        websocket_api.async_register_command(hass, websocket_list_users)
 
         # Register reminder-specific services
         async def async_stop_reminder(call: ServiceCall):
@@ -592,6 +602,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 vol.Optional("repeat_days"): _validate_repeat_days,
                 vol.Optional(ATTR_SPOTIFY_SOURCE): cv.string,
                 vol.Optional(ATTR_VOLUME): _validate_volume,
+                vol.Optional(ATTR_USER_ID): OWNER_FIELD_SCHEMA,
             }, extra=vol.ALLOW_EXTRA),
         )
 
@@ -612,6 +623,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
                 vol.Optional("repeat"): _validate_repeat,
                 vol.Optional("repeat_days"): _validate_repeat_days,
                 vol.Optional(ATTR_VOLUME): _validate_volume,
+                vol.Optional(ATTR_USER_ID): OWNER_FIELD_SCHEMA,
             }, extra=vol.ALLOW_EXTRA),
         )
 
@@ -1200,6 +1212,41 @@ async def _async_handle_resolve_media_ws(hass, connection, msg):
         connection.send_error(msg["id"], "resolve_failed", str(err))
         return
 
+    connection.send_result(msg["id"], result)
+
+
+async def _async_handle_list_users_ws(hass, connection, msg):
+    """Return assignable Home Assistant users for companion card owner fields."""
+    current_user = getattr(connection, "user", None)
+    current_user_id = getattr(current_user, "id", None)
+    try:
+        users = await hass.auth.async_get_users()
+    except Exception as err:
+        connection.send_error(msg["id"], "users_failed", str(err))
+        return
+
+    result = {
+        "users": [
+            {
+                "id": user.id,
+                "name": user.name or user.id,
+                "is_current": user.id == current_user_id,
+            }
+            for user in users
+            if getattr(user, "is_active", True)
+            and not getattr(user, "system_generated", False)
+        ],
+        "current_user_id": current_user_id,
+    }
+    result["users"].sort(
+        key=lambda user: (
+            not user["is_current"],
+            str(user["name"]).casefold(),
+            user["id"],
+        )
+    )
+    connection.send_result(msg["id"], result)
+
 
 @websocket_api.websocket_command(
     {
@@ -1215,4 +1262,12 @@ async def websocket_resolve_media_metadata(hass, connection, msg):
     await _async_handle_resolve_media_ws(hass, connection, msg)
 
 
-    connection.send_result(msg["id"], result)
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/users",
+    }
+)
+@websocket_api.async_response
+async def websocket_list_users(hass, connection, msg):
+    """List Home Assistant users for HA Alarm Clock owner assignment."""
+    await _async_handle_list_users_ws(hass, connection, msg)

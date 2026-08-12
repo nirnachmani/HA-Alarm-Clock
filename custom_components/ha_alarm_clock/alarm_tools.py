@@ -288,8 +288,9 @@ class SetAlarmTool(llm.Tool):
 
             # Create a mock ServiceCall-like object
             class MockServiceCall:
-                def __init__(self, data):
+                def __init__(self, data, context):
                     self.data = data
+                    self.context = context
 
             if sound_media:
                 service_data["sound_media"] = sound_media
@@ -317,7 +318,7 @@ class SetAlarmTool(llm.Tool):
                 except (TypeError, ValueError):
                     return {"error": "Volume must be numeric"}
 
-            call = MockServiceCall(service_data)
+            call = MockServiceCall(service_data, llm_context.context)
             target = {}
             if media_player:
                 target["media_player"] = media_player

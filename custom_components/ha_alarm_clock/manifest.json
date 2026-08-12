@@ -2,7 +2,7 @@
   "domain": "ha_alarm_clock",
   "name": "HA Alarm Clock",
   "description": "Alarm clock integration",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "slug": "ha_alarm_clock",
   "documentation": "https://github.com/nirnachmani/HA-Alarm-Clock",
   "issue_tracker": "https://github.com/nirnachmani/HA-Alarm-Clock/issues",

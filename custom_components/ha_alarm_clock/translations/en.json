@@ -20,11 +20,13 @@
           "hidden_media_players": "Hidden media players",
           "allowed_activation_entities": "Allowed activation entities",
           "enable_llm": "Enable LLM features",
+          "restrict_non_admin_ownership": "Restrict non-admin card ownership view",
           "default_snooze_minutes": "Default snooze minutes",
           "active_press_mode": "Active button press mode"
         },
         "data_description": {
-          "hidden_media_players": "Hide selected players from the alarm and reminder card pickers. Service calls and manual entity entry are unaffected."
+          "hidden_media_players": "Hide selected players from the alarm and reminder card pickers. Service calls and manual entity entry are unaffected.",
+          "restrict_non_admin_ownership": "When enabled, non-admin users only see their own alarms and reminders in the companion cards and cannot change ownership there. Services and Home Assistant state access are unaffected."
         }
       }
     },

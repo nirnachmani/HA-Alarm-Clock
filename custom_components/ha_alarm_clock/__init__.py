@@ -56,8 +56,10 @@ from .const import (
     CONF_ENABLE_LLM,
     CONF_ACTIVE_PRESS_MODE,
     CONF_DEFAULT_SNOOZE_MINUTES,
+    CONF_RESTRICT_NON_ADMIN_OWNERSHIP,
     DEFAULT_ENABLE_LLM,
     DEFAULT_HIDDEN_MEDIA_PLAYERS,
+    DEFAULT_RESTRICT_NON_ADMIN_OWNERSHIP,
     ALARM_ENTITY_DOMAIN,
     REMINDER_ENTITY_DOMAIN,
 )
@@ -890,6 +892,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         coordinator.set_active_press_mode(
             entry.options.get(CONF_ACTIVE_PRESS_MODE)
+        )
+        coordinator.set_restrict_non_admin_ownership(
+            entry.options.get(
+                CONF_RESTRICT_NON_ADMIN_OWNERSHIP,
+                DEFAULT_RESTRICT_NON_ADMIN_OWNERSHIP,
+            )
         )
         # Publish updated defaults/allow-list to the dashboard sensor immediately
         coordinator._update_dashboard_state()

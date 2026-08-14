@@ -18,6 +18,7 @@ from .const import (
     CONF_ENABLE_LLM,
     CONF_DEFAULT_SNOOZE_MINUTES,
     CONF_ACTIVE_PRESS_MODE,
+    CONF_RESTRICT_NON_ADMIN_OWNERSHIP,
     ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE,
     ACTIVE_PRESS_MODE_SHORT_SNOOZE_LONG_STOP,
     DEFAULT_ALARM_SOUND,
@@ -26,6 +27,7 @@ from .const import (
     DEFAULT_HIDDEN_MEDIA_PLAYERS,
     DEFAULT_NAME,
     DEFAULT_ENABLE_LLM,
+    DEFAULT_RESTRICT_NON_ADMIN_OWNERSHIP,
     DEFAULT_ALLOWED_ACTIVATION_ENTITIES,
     DEFAULT_SNOOZE_MINUTES,
     DEFAULT_ACTIVE_PRESS_MODE,
@@ -161,6 +163,13 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 default=self.config_entry.options.get(CONF_ENABLE_LLM, DEFAULT_ENABLE_LLM),
             ): bool,
             vol.Optional(
+                CONF_RESTRICT_NON_ADMIN_OWNERSHIP,
+                default=self.config_entry.options.get(
+                    CONF_RESTRICT_NON_ADMIN_OWNERSHIP,
+                    DEFAULT_RESTRICT_NON_ADMIN_OWNERSHIP,
+                ),
+            ): bool,
+            vol.Optional(
                 CONF_DEFAULT_SNOOZE_MINUTES,
                 default=self.config_entry.options.get(
                     CONF_DEFAULT_SNOOZE_MINUTES, DEFAULT_SNOOZE_MINUTES
@@ -171,11 +180,22 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 default=self.config_entry.options.get(
                     CONF_ACTIVE_PRESS_MODE, DEFAULT_ACTIVE_PRESS_MODE
                 ),
-            ): vol.In(
-                [
-                    ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE,
-                    ACTIVE_PRESS_MODE_SHORT_SNOOZE_LONG_STOP,
-                ]
+            ): selector.selector(
+                {
+                    "select": {
+                        "options": [
+                            {
+                                "value": ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE,
+                                "label": "Tap stops, hold snoozes",
+                            },
+                            {
+                                "value": ACTIVE_PRESS_MODE_SHORT_SNOOZE_LONG_STOP,
+                                "label": "Tap snoozes, hold stops",
+                            },
+                        ],
+                        "mode": "list",
+                    }
+                }
             ),
         })
 

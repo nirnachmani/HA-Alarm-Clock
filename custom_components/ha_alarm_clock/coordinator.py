@@ -32,6 +32,7 @@ from .const import (
     DEFAULT_ALARM_SOUND,
     DEFAULT_REMINDER_SOUND,
     DEFAULT_ACTIVE_PRESS_MODE,
+    DEFAULT_RESTRICT_NON_ADMIN_OWNERSHIP,
     ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE,
     ACTIVE_PRESS_MODE_SHORT_SNOOZE_LONG_STOP,
     ACTIVE_RESUME_GRACE_MINUTES,
@@ -617,6 +618,7 @@ class AlarmAndReminderCoordinator:
         self._allowed_activation_entities: set[str] | None = None
         self._default_snooze_minutes: int = DEFAULT_SNOOZE_MINUTES
         self._active_press_mode: str = DEFAULT_ACTIVE_PRESS_MODE
+        self._restrict_non_admin_ownership: bool = DEFAULT_RESTRICT_NON_ADMIN_OWNERSHIP
         _LOGGER.debug("New coordinator instance created: %s", id(self))
         
         # Remove legacy entities (pre-refactor namespace) if present to avoid duplication
@@ -744,6 +746,14 @@ class AlarmAndReminderCoordinator:
     def get_active_press_mode(self) -> str:
         """Return the configured active press mode."""
         return self._active_press_mode
+
+    def set_restrict_non_admin_ownership(self, enabled: bool | None) -> None:
+        """Set whether companion cards restrict non-admin users to owned items."""
+        self._restrict_non_admin_ownership = bool(enabled)
+
+    def get_restrict_non_admin_ownership(self) -> bool:
+        """Return whether companion cards should restrict non-admin ownership views."""
+        return self._restrict_non_admin_ownership
 
     async def _prepare_sound_descriptor(self, raw_media, *, is_alarm: bool) -> Dict[str, Any]:
         """Convert raw service input into a normalized media descriptor."""
@@ -4825,6 +4835,7 @@ class AlarmAndReminderCoordinator:
                 "default_reminder_sound": DEFAULT_REMINDER_SOUND,
                 "default_snooze_minutes": self.get_default_snooze_minutes(),
                 "active_press_mode": self.get_active_press_mode(),
+                "restrict_non_admin_ownership": self.get_restrict_non_admin_ownership(),
                 "hidden_media_players": self.get_hidden_media_players(),
                 "allowed_activation_entities": sorted(self._allowed_activation_entities)
                 if self._allowed_activation_entities

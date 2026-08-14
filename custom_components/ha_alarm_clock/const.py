@@ -48,6 +48,7 @@ CONF_ALLOWED_ACTIVATION_ENTITIES = "allowed_activation_entities"
 CONF_ENABLE_LLM = "enable_llm"
 CONF_DEFAULT_SNOOZE_MINUTES = "default_snooze_minutes"
 CONF_ACTIVE_PRESS_MODE = "active_press_mode"
+CONF_RESTRICT_NON_ADMIN_OWNERSHIP = "restrict_non_admin_ownership"
 
 ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE = "short_stop_long_snooze"
 ACTIVE_PRESS_MODE_SHORT_SNOOZE_LONG_STOP = "short_snooze_long_stop"
@@ -64,6 +65,7 @@ DEFAULT_SNOOZE_MINUTES = 5  # Default snooze time in minutes
 DEFAULT_ACTIVE_PRESS_MODE = ACTIVE_PRESS_MODE_SHORT_STOP_LONG_SNOOZE
 DEFAULT_NOTIFICATION_TITLE = "HA Alarm Clock"
 DEFAULT_ENABLE_LLM = False
+DEFAULT_RESTRICT_NON_ADMIN_OWNERSHIP = False
 
 # An item still marked "active" in storage on startup only resumes ringing if
 # its scheduled time is within this many minutes of now; older ones are stale

@@ -28,7 +28,15 @@ A centralised alarm clock and reminder integration for Home Assistant which play
 
 ## Installation
 
-### HACS (recommended)
+### Marketplace (Home Assistant 2026.11 and later)
+
+1. Open **Settings → Marketplace** and connect your GitHub account if prompted. Custom repositories require a GitHub connection.
+2. Select **Add from link**, enter `https://github.com/nirnachmani/HA-Alarm-Clock`, and choose **Integration** if prompted.
+3. Install **HA Alarm Clock** and follow its setup flow. If it does not open automatically, go to **Settings → Devices & Services → Add Integration** and search for **HA Alarm Clock**.
+
+Marketplace replaces HACS starting with Home Assistant 2026.11. Existing HACS installations migrate automatically. Follow any restart prompt when updating an installed integration.
+
+### HACS (Home Assistant 2026.10 and earlier)
 1. Open **HACS → ⋮ → Custom repositories**.
 2. Add `https://github.com/nirnachmani/HA-Alarm-Clock` and choose **Integration**.
 3. Search and download “HA Alarm Clock” and restart Home Assistant.
@@ -39,9 +47,11 @@ A centralised alarm clock and reminder integration for Home Assistant which play
 2. Restart Home Assistant.
 3. Go to **Settings → Devices & Services → Add Integration**, search for **HA Alarm Clock** and install.
 
-(Optional) Install the companion Lovelace cards for alarms and reminders (placeholder link: <cards-repo-link>). They give you full UI control, browsing, and media search.
+(Optional) Install the [companion Lovelace cards for alarms and reminders](https://github.com/nirnachmani/HA-Alarm-Clock-Cards). They give you full UI control, browsing, and media search.
 
 ### Media files
+
+Marketplace and HACS install only the integration folder. They do not copy the sample audio from this repository's `media files/` folder into Home Assistant's media library. Download those files manually as described below, or choose media you already have in the integration settings.
 
 - Download the media files and place them under /media/Alarms (not under /config/media but under the root folder [in HAOS]) - this will make them available in HA under /media/local/Alarms
 - See https://www.home-assistant.io/integrations/media_source/ for further information  
